@@ -27,8 +27,8 @@ class Config:
         self.tbl_motor_path             = proj_root / "data" / "tabular" / "motor_summary_ses-01_new.csv"
         self.tbl_language_path          = proj_root / "data" / "tabular" / "language_summary_ses01.csv"
         self.traintest_split_path       = proj_root / "data" / "meta" / "train-test_subjs.json"
-        self.dropped_feature_names_path = proj_root / "data" / "meta" / "features_dropped.txt"
-        self.feature_names_path         = proj_root / "data" / "meta" / "features.txt"
+        self.dropped_feature_names_path = proj_root / "data" / "meta" / "preproc_features_dropped.txt"
+        self.feature_names_path         = proj_root / "data" / "meta" / "preproc_features.txt"
         self.tbl_out_path               = proj_root / "data" / "tabular" / "df_preproc.csv"
 
 

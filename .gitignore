@@ -4,6 +4,7 @@
 data/*
 etc/licenses/
 models/
+results/
 scripts/.env
 scripts/archived/
 tmp/
