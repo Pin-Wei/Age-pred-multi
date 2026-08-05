@@ -1,16 +1,104 @@
 #!/usr/bin/env python3
+#
+# Shared helpers for the multi-modal brain-age prediction pipeline.
+#
+# Contents
+# --------
+# - `custom_print`        : print with a severity tag, an optional time stamp, and a mute switch (`MUTED`)
+# - `get_col_names`       : canonical column-name lists of the raw source tables
+# - `print_missing`       : report participants absent from a modality
+# - `load_img_data`       : load a NIfTI image as a float32 array
+# - `get_tbss_processed`  : 4-D TBSS stack -> masked, downsampled, z-scored (N, n_vox) matrix
+# - `load_feat_table`     : load a feature table (.csv / .npz) as (subject IDs, X)
+# - `train_eval_model`    : nested-CV fit of a standardized linear model, with caching
+# - `to_json_compatible`  : recursively convert a value (keys included) into JSON-safe built-ins
 
 
 import os
+import json
+import math
+import datetime as dt
+from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import nibabel as nib
+
+
+MUTED = 0  # module-wide default; set via `import utils; utils.MUTED = 2`
+
+
+def custom_print(msg: object = "", level: str = "INFO", with_time: bool = False):
+    '''
+    Print one message, tagged by its severity and optionally time-stamped.
+
+    Parameters
+    ----------
+    - msg : Any, default ""
+        The message; non-str values are converted with `str`.
+        Leading and trailing newlines are kept outside the tag and the time stamp,
+        so e.g. f"\\nSaved: {path}\\n" still prints its own blank lines.
+        The default prints an empty line, i.e. a bare `print()`.
+
+    - level : {"INFO", "WARNING", "ERROR"}, default "INFO"
+        Severity of the message; case-insensitive.
+        "INFO" carries no tag (so its output matches a plain `print`);
+        the others are prefixed with "[Warning] " / "[Error] ".
+
+    - with_time : bool, default False
+        Prefix the message with "[YYYY-MM-DD HH:MM:SS] ".
+
+    Raises
+    ------
+    KeyError
+        If `level` is not one of the keys above.
+
+    Notes
+    -----
+    Messages below the module-wide severity floor `MUTED` are dropped:
+    0 prints everything, 1 mutes INFO, 2 also mutes WARNING, 3 mutes all.
+    It is read at call time, so a caller sets it via `import utils; utils.MUTED = 2`
+
+    `tags` doubles as the severity ordering:
+    the floor is compared againstthe position of `level` in it, 
+    so a new level must be inserted in rank order.
+    '''
+    tags = {"INFO": "", "WARNING": "[Warning] ", "ERROR": "[Error] "}
+    level = level.upper()
+
+    if list(tags.keys()).index(level) < MUTED:
+        return
+
+    body = str(msg).strip("\n")
+    if body:  # keep pure separators (e.g. "" or "\n") unadorned
+        lead, trail = str(msg).split(body)
+        stamp = f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] " if with_time else ""
+        body = f"{lead}{stamp}{tags[level]}{body}{trail}"
+
+    print(body, flush=True)
 
 
 def get_col_names(name: str) -> list[str]:
-    return {
+    '''
+    Return the canonical column names of one source table.
+
+    Parameters
+    ----------
+    - name : {"basic_info_cols", "basic_q_cols", "structure_cols", "motor_cols", "language_cols"}
+        Which group of columns to return.
+
+    Returns
+    -------
+    - list[str]
+        A fresh list (safe to mutate) of the column names, in source-table order.
+        Sizes: basic_info 28, basic_q 29, structure 512, motor 394, language 66.
+
+    Raises
+    ------
+    KeyError
+        If `name` is not one of the keys above.
+    '''
+    _col_names = {
         "basic_info_cols": [
             "AGE", 
             "SEX",
@@ -1050,52 +1138,105 @@ def get_col_names(name: str) -> list[str]:
             "SPEECHCOMP_MRI_DiffOC_LeftAntTemporalPole_BETA",
             "SPEECHCOMP_MRI_DiffPC_LeftAntTemporalPole_BETA",
         ]
-    }[name]
+    }
+
+    if name not in _col_names:
+        raise KeyError(f"Unknown column group '{name}'. Available: {sorted(_col_names)}")
+
+    return _col_names[name]
 
 
-def print_missing(all_subjs: list[str], data_subjs: list[str]):
-    missing = [ s for s in all_subjs if s not in data_subjs ]
+def print_missing(all_subjs: list[str], data_subjs: list[str]) -> list[str]:
+    '''
+    Print the participants present in `all_subjs` but absent from `data_subjs`.
+
+    Parameters
+    ----------
+    - all_subjs : container of str
+        The reference roster, e.g. every participant in the demographics table.
+
+    - data_subjs : container of str
+        The participants a given modality actually has data for.
+
+    Returns
+    -------
+    - missing : list[str]
+        The absent participants, sorted; empty when there is none.
+
+    Notes
+    -----
+    Reports only; nothing is raised.
+    '''
+    missing = sorted(set(all_subjs).difference(set(data_subjs)))
 
     if missing:
-        print(f"\n[Warning] data of {len(missing)} participant(s) are missing:")
+        custom_print(f"\ndata of {len(missing)} participant(s) are missing:", level="WARNING")
         for m in missing:
-            print(f"\t- {m}")
+            custom_print(f"\t- {m}")
+
+    return missing
 
 
 def load_img_data(
-    img_path: [str | Path], 
-    print_infos: bool = False, 
+    img_path: str | Path,
+    print_infos: bool = False,
     get_affine: bool = False
-) -> np.ndarray:
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     '''
-    Load the image and return its array data
-    If `print_infos` is True, print specified information about the image
-    If `get_affine` is True, returns image affine as well
+    Load a NIfTI image and return its voxel data as a float32 array.
+
+    Parameters
+    ----------
+    - img_path : str or os.PathLike
+        Path of the image file. Must exist.
+
+    - print_infos : bool, default False
+        Also print the image shape, axis orientation codes,
+        the meaning of its `sform_code`, and the header `descrip` field.
+
+    - get_affine : bool, default False
+        Also return the 4x4 voxel-to-world affine.
+
+    Returns
+    -------
+    - np.ndarray, dtype float32
+        The voxel data, with the image's own shape (e.g. (X, Y, Z) or (X, Y, Z, N)).
+
+    - affine : np.ndarray, shape (4, 4)
+        Returned as the second element of a tuple, only when `get_affine=True`.
+
+    Raises
+    ------
+    AssertionError
+        If `img_path` is not an existing file. 
     '''
+    
+    import nibabel as nib
+
     def _print_infos(img: nib.nifti1.Nifti1Image):
         hdr = img.header
-        print(f"Image shape: {img.shape}")
-        print(f"Image orientations: {nib.aff2axcodes(img.affine)}")
-        print({
+        custom_print(f"Image shape: {img.shape}")
+        custom_print(f"Image orientations: {nib.aff2axcodes(img.affine)}")
+        custom_print({
             0: "sform not defined", 
             1: "RAS+ in scanner coordinates", 
             2: "RAS+ aligned to some other scan", 
             3: "RAS+ in Talairach atlas space", 
             4: "RAS+ in MNI atlas space"
-        }[hdr["sform_code"]])
-        print(f'Description: {hdr["descrip"]}')
-        print()
+        }[int(hdr["sform_code"])])
+        custom_print(f'Description: {hdr["descrip"]}')
+        custom_print()
 
     img_path = str(img_path)
     assert os.path.isfile(img_path), f"Image file not exists: {img_path}"
 
-    print(f"Loading image: {img_path}")
+    custom_print(f"Loading image: {img_path}")
     img = nib.load(img_path)
 
     if print_infos:
         _print_infos(img)
 
-    print("Loading the array data ...")
+    custom_print("Loading the array data ...")
     img_dat = np.asarray(img.dataobj, dtype=np.float32)  # avoid caching
         # see: https://nipy.org/nibabel/images_and_memory.html#use-the-array-proxy-instead-of-get-fdata
 
@@ -1106,23 +1247,98 @@ def load_img_data(
     
 
 def get_tbss_processed(
-    img_path: [str | Path], 
-    mask_path: [str | Path], 
-    cache: [str | Path], 
-    N: int, 
-    stride: int, 
-    **kwargs
+    img_path: str | Path,
+    mask_path: str | Path,
+    cache: str | Path,
+    N: int,
+    stride: int
 ) -> np.ndarray:
     '''
-    Load the 4-D TBSS stack, downsample it by stride, 
-    extract in-mask voxels and flatten it per participant, 
-    and z-score with global mean and SD
+    Load the 4-D TBSS stack, downsample it by `stride`,
+    keep the in-mask voxels and flatten them per participant.
 
-    Returns: (N, n_vox) float32
+    The participant axis is moved to the front,
+    so row `i` of the output corresponds to volume `i` of the 4-D stack
+    (i.e. the order in which TBSS merged the per-subject volumes; alphabetical over `origdata/*.nii.gz`)
+
+    No scaling is applied here; 
+    `train_eval_model` fits a `StandardScaler` per fold on its own training subset.
+
+    Parameters
+    ----------
+    - img_path : str or os.PathLike
+        The 4-D stack, shape (X, Y, Z, N), e.g. `stats/all_FA.nii.gz`.
+
+    - mask_path : str or os.PathLike
+        A 3-D mask, shape (X, Y, Z), matching `img_path`'s spatial grid.
+        Voxels with value > 0 are kept.
+
+    - cache : str or os.PathLike
+        Where the processed matrix is stored via `np.save` / `np.load`.
+        A ".npy" suffix is appended when absent (to write file).
+        A sibling ".json" holds the cache key 
+        (i.e., the source and mask file names and byte sizes, `stride` and `N`).
+        The cache is reused only when that key still matches. 
+        A ".npy" with no readable ".json" beside it is treated as a miss and rebuilt.
+
+    - N : int
+        Expected participant count. Checked against the 4-D stack's last axis.
+
+    - stride : int
+        Downsampling step applied to all three spatial axes (`[::stride]`).
+
+    Returns
+    -------
+    - np.ndarray, shape (N, n_vox), dtype float32
+        On a cache miss: a freshly computed, writeable in-memory array.
+        On a cache hit: a read-only `np.memmap` (`mmap_mode="r"`).
+        Copy it first if the caller needs to mutate it.
+
+    Raises
+    ------
+    AssertionError
+        If the 4-D stack's participant count does not equal `N`.
     '''
+    def _cache_key():
+        '''
+        The identity of the result: every input that changes the returned matrix.
+        Source images are identified by file name and byte size rather than by
+            content hash (hashing a multi-GB NIfTI on every call would cost more than recomputing) 
+            or by mtime (re-fetching identical data would needlessly invalidate the cache).
+        '''
+        def _stat(p):
+            p = str(p)
+            return {"name": os.path.basename(p), "bytes": os.path.getsize(p)}
+
+        return {
+            "img"   : _stat(img_path),
+            "mask"  : _stat(mask_path),
+            "stride": int(stride),
+            "N"     : int(N)
+        }
+
+    cache = Path(cache)
+    if cache.suffix != ".npy":  # np.save appends it, np.load would not find it
+        cache = cache.with_name(cache.name + ".npy")
+        
+    key_path = cache.with_suffix(".json")
+    key = _cache_key()
+
     if cache.exists():
-        print(f"Loaded from cache: {cache}")
-        return np.load(cache, mmap_mode="r")
+        try:
+            cached_key = json.loads(key_path.read_text())
+        except (OSError, ValueError):
+            cached_key = None
+
+        if cached_key == key:
+            custom_print(f"Loaded from cache: {cache}")
+            return np.load(cache, mmap_mode="r")
+
+        stale = (
+            "no readable cache key" if cached_key is None 
+            else ", ".join( f"{k}: {cached_key.get(k)!r} -> {v!r}" for k, v in key.items() if cached_key.get(k) != v )
+        )
+        custom_print(f"Stale cache, recomputing ({stale}): {cache}", level="WARNING")
 
     img_dat = load_img_data(img_path)
     N_v = img_dat.shape[-1]
@@ -1136,54 +1352,172 @@ def get_tbss_processed(
     bin_mask = mask_dat > 0
 
     img_flat = img_dat[:, bin_mask].copy()  # (N, n_vox)
-    mu = float(img_flat.mean())
-    sd = float(img_flat.std()) + 1e-6
 
-    img_flat_normed = (img_flat - mu) / sd
-    np.save(cache, img_flat_normed)
-    print(f"Saved cache ({img_flat_normed.nbytes / 1e9:.2f} GB): {cache}")
+    np.save(cache, img_flat)
+    key_path.write_text(json.dumps(key, indent=2))
+    custom_print(f"Saved cache ({img_flat.nbytes / 1e9:.2f} GB): {cache}")
 
-    return img_flat_normed
+    return img_flat
 
 
 def load_feat_table(
-    tbl_path: [str | Path], 
-    prefer_npz: bool = True
-) -> tuple[np.ndarray, np.ndarray]:
-    tbl_path = Path(tbl_path)
+    tbl_path: str | Path,
+    prefer_npz: bool = True,
+    usecols: list[str] = None,
+    id_col: str = None
+) -> tuple[np.ndarray, pd.DataFrame]:
+    '''
+    Load a feature table and split it into participant IDs and a feature matrix.
 
-    if prefer_npz and tbl_path.suffix == ".csv":
+    The two accepted formats hold the same logical table 
+    (one ID column plus named feature columns) 
+    and are treated identically from the caller's point of view. 
+
+    Only the on-disk layout differs:
+      - ".csv" : header row; the ID column is `id_col`, or the first column 
+        when `id_col` is omitted. Every other column is a feature.
+      - ".npz" : "SID" holds the IDs, "X" the (n_samples, n_features) block, and
+        "feats" the feature names (as written by the `make_df_*.py` scripts).
+
+    Parameters
+    ----------
+    - tbl_path : str or os.PathLike
+        Path of a ".csv" or ".npz" table.
+
+    - prefer_npz : bool, default True
+        When `tbl_path` is a ".csv" and a sibling ".npz" of the same stem exists,
+        load the ".npz" instead.
+        The redirect is skipped when `usecols` is given but the ".npz" carries no "feats" key.
+
+    - usecols : list[str], optional
+        Names of the feature columns to keep; all of them by default.
+        Honoured by both formats. 
+        The name of the ID column may be included and is then ignored, 
+        so the usual `[id_col] + feature_names` works unchanged.
+        For ".csv" the selection is pushed down into `pd.read_csv`, 
+        so unwanted columns of a wide table are never parsed.
+        Names matching no column raise, rather than being quietly dropped.
+        Column order always follows the stored table, not the order listed here.
+
+    - id_col : str, optional
+        Name of the ID column, defaulting to the first column of the ".csv".
+        The header is read for this even when `prefer_npz` redirects to the ".npz", 
+        whose IDs are always taken from "SID" positionally. 
+        Pass it explicitly when addressing a ".npz" directly with an ID-bearing `usecols`.
+
+    Returns
+    -------
+    - subjs : np.ndarray of str, shape (n_samples,)
+        Participant IDs of the surviving rows.
+
+    - X : pd.DataFrame, shape (n_samples, n_features), dtype float32
+        Feature matrix, row-aligned with `subjs` and carrying the stored feature names as its columns, 
+        so that a model fitted on it keeps them (`feature_names_in_`)
+        and its coefficients stay addressable by name.
+        The index is a fresh `RangeIndex`; 
+        address rows positionally (`.iloc`), as `subjs` does.
+        A ".npz" without a "feats" key yields positional placeholders ("col-0", ...),
+        the one case where the names are ours rather than the table's.
+
+    Raises
+    ------
+    ValueError
+        - the suffix is neither ".csv" nor ".npz"
+        - `usecols` names columns the table does not have
+        - `usecols` is given for a ".npz" without a "feats" key
+    KeyError
+        If a ".npz" lacks the "SID" or "X" key.
+
+    Notes
+    -----
+    Rows are dropped when the ID is missing or any *selected* feature is NaN,
+    so `subjs` and `X` are always row-aligned and complete.
+    Narrowing `usecols` can therefore keep more participants than loading the full table.
+    Only NaN is filtered;
+    extreme values pass through untouched and will break a downstream `StandardScaler`.
+    '''
+    def _select(all_feats: list[str]) -> list[int]:
+        '''
+        Returns positions of the requested feature columns in stored-table order.
+        '''
+        wanted = set(usecols)
+        missing = wanted - set(all_feats) - {id_col}
+        if missing:
+            raise ValueError(
+                f"{len(missing)} column(s) requested via 'usecols' are not in {tbl_path.name}: {sorted(missing)[:10]}"
+                + ( "" if id_col else "\n(the ID column is unnamed in a .npz; pass 'id_col' if one of these is it)" )
+            )
+        return [ i for i, f in enumerate(all_feats) if f in wanted ]
+
+    tbl_path = Path(tbl_path)
+    csv_path = tbl_path if tbl_path.suffix == ".csv" else None
+
+    header = pd.read_csv(csv_path, nrows=0).columns.tolist() if csv_path is not None else None
+    if id_col is None and header is not None:
+        id_col = header[0]
+
+    if prefer_npz and csv_path is not None:
         npz_path = tbl_path.with_suffix(".npz")
+        
         if npz_path.exists():
-            tbl_path = npz_path
+            with np.load(npz_path, allow_pickle=True) as probe:
+                has_feats = ("feats" in probe.files)
+
+            if usecols is None or has_feats:
+                tbl_path = npz_path
+            else:
+                custom_print(f"{npz_path.name} has no 'feats' key; reading {tbl_path.name} so that 'usecols' is honoured.")
 
     if tbl_path.suffix == ".npz":
         dat = np.load(tbl_path, allow_pickle=True)
         subjs = dat["SID"].astype(str)
-        X = dat["X"].astype(np.float32)
+        X = dat["X"]
 
-        keep = ~np.isnan(np.asarray(X)).any(axis=1)
-        subjs = subjs[keep]
-        X = np.ascontiguousarray(np.asarray(X)[keep])
+        if "feats" in dat.files:
+            feats = dat["feats"].astype(str).tolist()
+        else:
+            feats = [ f"col-{i}" for i in range(X.shape[1]) ]
+            custom_print(f"{tbl_path.name} has no 'feats' key; naming its columns positionally ('col-0', ...).")
 
-    elif tbl_path.suffix in (".csv", ".tsv"):
-        df = pd.read_csv(tbl_path, sep="\t" if tbl_path.suffix == ".tsv" else ",")
-        df = df.dropna()
-        subjs = df.iloc[:, 0].to_numpy(dtype=str)
-        X = df.iloc[:, 1:].to_numpy(dtype=np.float32)
+        if usecols is not None:
+            if "feats" not in dat.files:
+                raise ValueError(f"'usecols' needs the feature names, but {tbl_path.name} has no 'feats' key. Pass prefer_npz=False to read the .csv.")
+
+            sel = _select(feats)
+            X = X[:, sel]
+            feats = [ feats[i] for i in sel ]
+
+        X = pd.DataFrame(X, columns=feats)
+
+    elif tbl_path.suffix == ".csv":
+        feats = [ c for c in header if c != id_col ]
+
+        if usecols is not None:
+            feats = [ feats[i] for i in _select(feats) ]
+
+        df = pd.read_csv(tbl_path, usecols=[id_col] + feats)
+        
+        df = df[df[id_col].notna()]
+        subjs = df[id_col].to_numpy(dtype=str)
+        X = df[feats]  # reordered to the stored order
 
     else:
         raise ValueError(f"Unsupported table format: '{tbl_path.suffix}' ({tbl_path})")
 
-    print(f"Loaded: {tbl_path.name}")
-    print(f"{len(subjs)} participants, {X.shape[1]} features")
+    X = X.astype(np.float32)
+    keep = X.notna().all(axis=1).to_numpy()
+    subjs = subjs[keep]
+    X = X[keep].reset_index(drop=True)
+
+    custom_print(f"From: {tbl_path.name}")
+    custom_print(f"{len(subjs)} participants, {X.shape[1]} features")
 
     return subjs, X
 
 
 def train_eval_model(
-    X: np.ndarray, 
-    y: np.ndarray, 
+    X: np.ndarray | pd.DataFrame,
+    y: np.ndarray,
     idx_tr: np.ndarray, 
     idx_te: np.ndarray, 
     model_type: str, 
@@ -1195,12 +1529,13 @@ def train_eval_model(
     max_iter: int = 10000, 
     n_jobs: int = -1, 
     verbose: int = 1, 
-    model_path_template: [str | Path] = None, 
-    model_perf_path: [str | Path] = None, 
+    impute_data: bool = False, 
+    model_path_template: str | Path = None,
+    model_perf_path: str | Path = None,
     overwrite: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
     '''
-    Fit a standardized linear regression model (with built-in CV for regularization strength) 
+    Fit a standardized linear regression model (with built-in CV for regularization strength)
     and return predictions for both the training and the testing set.
 
     - For training set, predictions are generated over k-folds from models trained on out-of-fold data
@@ -1213,17 +1548,29 @@ def train_eval_model(
       (always 5-fold regardless of `n_folds`, seeded by `seed_inner`)
     - If `model_path_template` is given, fitted pipelines are cached to disk;
       an existing file is loaded instead of refitted unless `overwrite=True`
+      (every model goes through the same `_fit_or_load` helper, so the outer
+      folds and the full-training-set model behave identically in this respect)
+    - `n_folds <= 1` switches to a degenerate single-model mode; 
+      see the note at the end of this docstring, as several behaviours below change
 
     Parameters
     ----------
-    - X : np.ndarray, shape (n_samples, n_features)
-        Feature matrix. Rows must align with `y`.
+    - X : np.ndarray or pd.DataFrame, shape (n_samples, n_features)
+        Feature matrix. Rows must align with `y` and are addressed positionally,
+        so a `pd.DataFrame` is expected to carry a default `RangeIndex`
+        (as `load_feat_table` returns).
+        Pass a `pd.DataFrame` to keep the feature names: every fitted pipeline then
+        records them in `feature_names_in_`, and the coefficients of a cached model
+        stay addressable by name
+        (`pipe[:-1].get_feature_names_out()` lines up with `pipe[-1].coef_`).
+        A cached pipeline fitted before the names existed is still fed a bare array,
+        so old caches keep working without warnings.
 
     - y : np.ndarray, shape (n_samples,)
         Target values (1-D), e.g. chronological age.
 
     - idx_tr : np.ndarray of int
-        Row indices of `X` / `y` forming the training set. 
+        Row indices of `X` / `y` forming the training set.
         Split further into `n_folds` outer folds to produce out-of-fold predictions.
 
     - idx_te : np.ndarray of int
@@ -1263,27 +1610,29 @@ def train_eval_model(
         (`RidgeCV` accepts neither `verbose` nor `n_jobs`).
 
     - model_path_template : str or os.PathLike, optional
-        Path template for caching fitted pipelines via `joblib.dump` / `joblib.load`;
-        must contain a single "{}" placeholder and end with ".joblib".
-        Filled with "fold-0" ... "fold-{n_folds-1}" for the outer-fold models
-        and "test" for the model trained on all of `idx_tr`.
-        Parent directory is created if needed.
-        A path that already exists is loaded rather than refitted, unless `overwrite`.
-        If omitted, models are neither loaded nor saved.
+        + Path template for caching fitted pipelines via `joblib.dump` / `joblib.load`;
+          must contain a single "{}" placeholder and end with ".joblib".
+        + Filled with "fold-0" ... "fold-{n_folds-1}" for the outer-fold models
+          and "all" for the model trained on all of `idx_tr`
+          (in the `n_folds <= 1` mode, only the "all" model exists).
+        + Parent directory is created if needed.
+        + A path that already exists is loaded rather than refitted, unless `overwrite`.
+        + If omitted, models are neither loaded nor saved.
 
     - model_perf_path : str or os.PathLike, optional
-        Path of a ".csv" file to write performance metrics in long format,
-        with columns `Split`, `N`, `MAE`, `R2` and one row per split:
-          - "Val_fold-0" ... "Val_fold-{n_folds-1}" : each outer fold's held-out samples
-          - "Val_mean" / "Val_SD"                   : mean and sample SD (ddof=1) across those folds
-          - "Val_pooled"                            : all out-of-fold predictions on `idx_tr` scored at once
-          - "Test"                                  : predictions on `idx_te`
-        `N` is the number of samples scored, left empty for the "Val_mean" / "Val_SD" rows.
-        Note that "Val_pooled" is not a per-fold average: its MAE equals "Val_mean" only when
-        the folds are of equal size, and its R2 is computed against the mean of all of `y[idx_tr]`.
-        Parent directory is created if needed.
-        Always (re)written when given, regardless of `overwrite`.
-        If omitted, metrics are neither computed nor saved.
+        + Path of a ".csv" file to write performance metrics in long format,
+        + with columns `Split`, `N`, `MAE`, `R2` and one row per split:
+           - "Val_fold-0" ... "Val_fold-{n_folds-1}" : each outer fold's held-out samples
+           - "Val_mean" / "Val_SD"                   : mean and sample SD (ddof=1) across those folds
+           - "Val_pooled"                            : all out-of-fold predictions on `idx_tr` scored at once
+           - "Test"                                  : predictions on `idx_te`
+        + In the `n_folds <= 1` mode the rows are instead "Train" and "Test".
+        + `N` is the number of samples scored, left empty for the "Val_mean" / "Val_SD" rows.
+        + Note that "Val_pooled" is not a per-fold average: its MAE equals "Val_mean" only when
+          the folds are of equal size, and its R2 is computed against the mean of all of `y[idx_tr]`.
+        + Parent directory is created if needed.
+        + Always (re)written when given, regardless of `overwrite`.
+        + If omitted, metrics are neither computed nor saved.
 
     - overwrite : bool, default False
         Refit and re-dump every model even when its `model_path_template` file exists.
@@ -1298,9 +1647,10 @@ def train_eval_model(
         `np.nan` elsewhere.
         
     - fold_n : np.ndarray, shape (n_samples,), dtype int8
-        Outer-fold index (0 ... `n_folds`-1) 
-        at which each training sample was held out; 
+        Outer-fold index (0 ... `n_folds`-1)
+        at which each training sample was held out;
         -1 for testing and unused samples.
+        In the `n_folds <= 1` mode every sample in `idx_tr` is labelled 0.
 
     Raises
     ------
@@ -1310,169 +1660,323 @@ def train_eval_model(
         - `idx_tr` / `idx_te` are not integer indices, are empty, are out of bounds, or overlap
         - `model_type` is unknown
         - the output paths violate the format constraints above
+    ValueError
+        - `model_type` is unknown and assertions are disabled (`python -O`),
+          raised later from `_init_model`
     '''
 
-    import os
     import joblib
-    from sklearn.pipeline import make_pipeline
+    from sklearn.pipeline import Pipeline
+    from sklearn.impute import SimpleImputer
     from sklearn.preprocessing import StandardScaler
     from sklearn.linear_model import ElasticNetCV, LassoCV, RidgeCV
     from sklearn.model_selection import KFold
 
-    def _init_model(*args, **kwargs):
-        _kf = KFold(n_splits=5, shuffle=True, random_state=seed_inner)
+    def _validate_inputs():
+        assert X.shape[0] == len(y), f"\nMismatch between length of X ({X.shape[0]}) and y ({len(y)})\n"
+        assert y.ndim == 1, f"\ny must be 1-D, got shape {y.shape}\n"
+        assert idx_tr.dtype.kind in "iu" and idx_te.dtype.kind in "iu", f"\nidx_tr/idx_te must be integer indices, got {idx_tr.dtype}/{idx_te.dtype}\n"
 
-        if model_type == "elasticnet": 
-            return make_pipeline(
-                StandardScaler(), 
-                ElasticNetCV(
-                    l1_ratio=l1_ratios, 
-                    alphas=alphas, 
-                    cv=_kf, 
-                    max_iter=max_iter, 
-                    n_jobs=n_jobs, 
-                    verbose=verbose
-                )
-            )
-        elif model_type == "lasso": 
-            return make_pipeline(
-                StandardScaler(), 
-                LassoCV(
-                    alphas=alphas, 
-                    cv=_kf, 
-                    max_iter=max_iter, 
-                    n_jobs=n_jobs, 
-                    verbose=verbose
-                )
-            )
-        elif model_type == "ridge": 
-            return make_pipeline(
-                StandardScaler(), 
-                RidgeCV(
-                    alphas=alphas, 
-                    cv=_kf
-                )
-            )
+        overlap = np.intersect1d(idx_tr, idx_te)
+        assert overlap.size == 0, f"\n{overlap.size} overlap(s) between training and testing indices\n"
+        assert model_type in ["elasticnet", "lasso", "ridge"], f"\nmodel_type '{model_type}' is undefined.\n"
+
+        for nm, idx in [("idx_tr", idx_tr), ("idx_te", idx_te)]:
+            assert idx.size > 0, f"\n{nm} is empty\n"
+            assert idx.min() >= 0 and idx.max() < len(y), f"\n{nm} out of bounds: [{idx.min()}, {idx.max()}] vs len(y)={len(y)}\n"
+
+        if model_path_template:
+            assert "{}" in model_path_template, "\n'model_path_template' should have '{}', got:\n" + model_path_template
+            assert model_path_template.endswith(".joblib"), f"\n'model_path_template' should end with .joblib, got:\n{model_path_template}"
+            _dir_1 = os.path.dirname(model_path_template.format("x"))
+            if _dir_1:
+                os.makedirs(_dir_1, exist_ok=True)
         else:
+            custom_print("\n'model_path_template' is not defined. No trained model will be saved.\n", level="WARNING")
+
+        if model_perf_path:
+            assert model_perf_path.endswith(".csv"), f"\n'model_perf_path' should end with .csv, got:\n{model_perf_path}"
+            _dir_2 = os.path.dirname(model_perf_path)
+            if _dir_2:
+                os.makedirs(_dir_2, exist_ok=True)
+        else:
+            custom_print("\n'model_perf_path' is not defined. Model performances will not be calculated and saved.\n", level="WARNING")
+
+    def _init_model():
+        '''
+        Create an unfitted pipeline, so that every fold fits its own scaler and regressor.
+        '''
+        _kf = KFold(n_splits=5, shuffle=True, random_state=seed_inner)
+        model_name_2_obj = {
+            "elasticnet": ElasticNetCV(
+                l1_ratio=l1_ratios, 
+                alphas=alphas, 
+                cv=_kf, 
+                max_iter=max_iter, 
+                n_jobs=n_jobs, 
+                verbose=verbose
+            ), 
+            "lasso": LassoCV(
+                alphas=alphas, 
+                cv=_kf, 
+                max_iter=max_iter, 
+                n_jobs=n_jobs, 
+                verbose=verbose
+            ), 
+            "ridge": RidgeCV(
+                alphas=alphas, 
+                cv=_kf
+            )
+        }
+
+        if model_type not in model_name_2_obj.keys():
             raise ValueError(f"Unknown model_type: {model_type}")
 
-    def _calc_model_perf(y: np.ndarray, y_pred: np.ndarray):
-        err = y - y_pred
-        mae = float(np.mean(np.abs(err)))
-        r2 = 1 - float(np.sum(err ** 2)) / float(np.sum((y - y.mean()) ** 2))
+        if impute_data:
+            return Pipeline(steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                ("model", model_name_2_obj[model_type])
+            ])
+        else:
+            return Pipeline(steps=[
+                ("scaler", StandardScaler()),
+                ("model", model_name_2_obj[model_type])
+            ])
+
+    def _get_rows(idx: np.ndarray) -> np.ndarray | pd.DataFrame:
+        return X.iloc[idx] if isinstance(X, pd.DataFrame) else X[idx]
+
+    def _fit_or_load(suffix: str, model, X_fit: np.ndarray | pd.DataFrame, y_fit: np.ndarray):
+        model_path = model_path_template.format(suffix) if model_path_template else None
+
+        if model_path and os.path.isfile(model_path) and not overwrite:
+            custom_print(f"Loaded pre-trained: {model_path}")
+            return joblib.load(model_path)
+
+        model.fit(X_fit, y_fit)
+
+        if model_path:
+            joblib.dump(model, model_path)
+            custom_print(f"\nSaved: {model_path}\n")
+
+        return model
+
+    def _calc_model_perf(y_true: np.ndarray, y_pred: np.ndarray):
+        err = y_true - y_pred
+        mae = np.mean(np.abs(err))
+        r2 = 1 - np.sum(err ** 2) / np.sum((y_true - y_true.mean()) ** 2)
         return {"MAE": mae, "R2": r2}
 
-    ## Check inputs validity --------------------------------------------------------
+    ## ------------------------------------------------------------------------------
 
     model_path_template = None if model_path_template is None else str(model_path_template)
     model_perf_path = None if model_perf_path is None else str(model_perf_path)
 
-    assert X.shape[0] == len(y), f"\nMismatch between length of X ({X.shape[0]}) and y ({len(y)})\n"
-    assert y.ndim == 1, f"\ny must be 1-D, got shape {y.shape}\n"
-    assert idx_tr.dtype.kind in "iu" and idx_te.dtype.kind in "iu", f"\nidx_tr/idx_te must be integer indices, got {idx_tr.dtype}/{idx_te.dtype}\n"
-
-    overlap = np.intersect1d(idx_tr, idx_te)
-    assert overlap.size == 0, f"\n{overlap.size} overlap(s) between training and testing indices\n"
-    assert model_type in ["elasticnet", "lasso", "ridge"], f"\nmodel_type '{model_type}' is undefined.\n"
-
-    for nm, idx in [("idx_tr", idx_tr), ("idx_te", idx_te)]:
-        assert idx.size > 0, f"\n{nm} is empty\n"
-        assert idx.min() >= 0 and idx.max() < len(y), f"\n{nm} out of bounds: [{idx.min()}, {idx.max()}] vs len(y)={len(y)}\n"
-
-    if model_path_template:
-        assert "{}" in model_path_template, "\n'model_path_template' should have '{}', got:\n" + model_path_template
-        assert model_path_template.endswith(".joblib"), f"\n'model_path_template' should end with .joblib, got:\n{model_path_template}"
-        _dir_1 = os.path.dirname(model_path_template.format("x"))
-        if _dir_1: 
-            os.makedirs(_dir_1, exist_ok=True)
-    else:
-        print("\n'model_path_template' is not defined. No trained model will be saved.\n")
-
-    if model_perf_path:
-        assert model_perf_path.endswith(".csv"), f"\n'model_perf_path' should end with .csv, got:\n{model_perf_path}"
-        _dir_2 = os.path.dirname(model_perf_path)
-        if _dir_2: 
-            os.makedirs(_dir_2, exist_ok=True)
-    else:
-        print("\n'model_perf_path' is not defined. Model performances will not be calculated and saved.\n")
-
-    ## ------------------------------------------------------------------------------
+    _validate_inputs()
 
     y_pred = np.full(len(y), np.nan, dtype=np.float32)
     fold_n = np.full(len(y), -1, dtype=np.int8)
+    perfs = []
 
-    ## For training set
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    for k, (tr, va) in enumerate(kf.split(idx_tr)):
-        m_cv = None
+    if n_folds > 1:
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
 
-        if model_path_template:
-            m_cv_fp = model_path_template.format(f"fold-{k}")
-            if os.path.isfile(m_cv_fp) and not overwrite:
-                m_cv = joblib.load(m_cv_fp)
-                print(f"Loaded pre-trained: {m_cv_fp}")
-                
-        if m_cv is None:
-            m_cv = _init_model(**locals())
-            m_cv.fit(X[idx_tr[tr]], y[idx_tr[tr]])
+        for k, (tr, va) in enumerate(kf.split(idx_tr)):
+            pipe_cv = _fit_or_load(
+                suffix=f"fold-{k}",
+                model=_init_model(),
+                X_fit=_get_rows(idx_tr[tr]),  # from local X
+                y_fit=y[idx_tr[tr]]
+            )
+            y_pred[idx_tr[va]] = pipe_cv.predict(_get_rows(idx_tr[va]))
+            fold_n[idx_tr[va]] = k
 
-            if model_path_template:
-                joblib.dump(m_cv, m_cv_fp)
-                print(f"\nSaved: {m_cv_fp}\n")
+            if model_perf_path:
+                perf_va = _calc_model_perf(y[idx_tr[va]], y_pred[idx_tr[va]])
+                perfs.append({
+                    "Split": f"Val_fold-{k}",
+                    "N"    : len(idx_tr[va]),
+                    "MAE"  : perf_va["MAE"],
+                    "R2"   : perf_va["R2"]
+                })
 
-        y_pred[idx_tr[va]] = m_cv.predict(X[idx_tr[va]])
-        fold_n[idx_tr[va]] = k
+        fold_mae = np.array([ p.get("MAE", np.nan) for p in perfs ])
+        fold_r2  = np.array([ p.get("R2", np.nan) for p in perfs ])
 
-    ## For testing set
-    m_te = None
+        pipe_te = _fit_or_load(
+            suffix="all",
+            model=_init_model(),
+            X_fit=_get_rows(idx_tr),
+            y_fit=y[idx_tr]
+        )
+        y_pred[idx_te] = pipe_te.predict(_get_rows(idx_te))
 
-    if model_path_template:
-        m_te_fp = model_path_template.format("test")
-        if os.path.isfile(m_te_fp) and not overwrite:
-            m_te = joblib.load(m_te_fp)
-            print(f"Loaded pre-trained: {m_te_fp}")
+        if model_perf_path:
+            perf_tr = _calc_model_perf(y[idx_tr], y_pred[idx_tr])
+            perf_te = _calc_model_perf(y[idx_te], y_pred[idx_te])
+            perfs += [
+                {"Split": "Val_mean"  , "N": None       , "MAE": fold_mae.mean()     , "R2": fold_r2.mean()},
+                {"Split": "Val_SD"    , "N": None       , "MAE": fold_mae.std(ddof=1), "R2": fold_r2.std(ddof=1)},
+                {"Split": "Val_pooled", "N": len(idx_tr), "MAE": perf_tr["MAE"]             , "R2": perf_tr["R2"]},
+                {"Split": "Test"      , "N": len(idx_te), "MAE": perf_te["MAE"]             , "R2": perf_te["R2"]}
+            ]
 
-    if m_te is None:
-        m_te = _init_model(**locals())
-        m_te.fit(X[idx_tr], y[idx_tr])
+    else: # model for training & testing set are the same
+        pipe_te = _fit_or_load(
+            suffix="all",
+            model=_init_model(),
+            X_fit=_get_rows(idx_tr),
+            y_fit=y[idx_tr]
+        )
+        y_pred[idx_tr] = pipe_te.predict(_get_rows(idx_tr))
+        fold_n[idx_tr] = 0
 
-        if model_path_template:
-            joblib.dump(m_te, m_te_fp)
-            print(f"\nSaved: {m_te_fp}\n")
+        y_pred[idx_te] = pipe_te.predict(_get_rows(idx_te))
 
-    y_pred[idx_te] = m_te.predict(X[idx_te])
-
-    ## Model performance scores
+        if model_perf_path:
+            perf_tr = _calc_model_perf(y[idx_tr], y_pred[idx_tr])
+            perf_te = _calc_model_perf(y[idx_te], y_pred[idx_te])
+            perfs += [
+                {"Split": "Train", "N": len(idx_tr), "MAE": perf_tr["MAE"], "R2": perf_tr["R2"]},
+                {"Split": "Test" , "N": len(idx_te), "MAE": perf_te["MAE"], "R2": perf_te["R2"]}
+            ]
+        
     if model_perf_path:
-
-        perfs = []
-        for k in range(n_folds):
-            idx_va = idx_tr[fold_n[idx_tr] == k]
-            perf_va = _calc_model_perf(y[idx_va], y_pred[idx_va])
-            perfs.append({
-                "Split": f"Val_fold-{k}",
-                "N"    : len(idx_va),
-                "MAE"  : perf_va["MAE"],
-                "R2"   : perf_va["R2"]
-            })
-
-        fold_mae = np.array([ p["MAE"] for p in perfs ])
-        fold_r2  = np.array([ p["R2"] for p in perfs ])
-
-        perf_tr = _calc_model_perf(y[idx_tr], y_pred[idx_tr])
-        perf_te = _calc_model_perf(y[idx_te], y_pred[idx_te])
-        perfs += [
-            {"Split": "Val_mean"  , "N": None       , "MAE": float(fold_mae.mean())     , "R2": float(fold_r2.mean())},
-            {"Split": "Val_SD"    , "N": None       , "MAE": float(fold_mae.std(ddof=1)), "R2": float(fold_r2.std(ddof=1))},
-            {"Split": "Val_pooled", "N": len(idx_tr), "MAE": perf_tr["MAE"]             , "R2": perf_tr["R2"]},
-            {"Split": "Test"      , "N": len(idx_te), "MAE": perf_te["MAE"]             , "R2": perf_te["R2"]}
-        ]
-
         perfs = pd.DataFrame(perfs)
         perfs["N"] = perfs["N"].astype("Int64")  # nullable int
         perfs.to_csv(model_perf_path, index=False)
-        print(f"\nSaved: {model_perf_path}\n")
+        custom_print(f"\nSaved: {model_perf_path}")
+        custom_print(f"Test MAE = {perf_te["MAE"]:.1f}")
 
     return y_pred, fold_n
 
 
+def to_json_compatible(data, nan_to_none: bool = True):
+    '''
+    Recursively convert a value into built-in Python types accepted by `json.dump`.
+
+    Both dict *values* and dict *keys* are converted, 
+    so the result is safe to dump with the strict `allow_nan=False`.
+
+    Parameters
+    ----------
+    - data : Any
+        Value to convert. Handled explicitly:
+        - numpy scalars / arrays          -> Python scalars / (nested) lists
+        - `tuple` / `set` / `frozenset`   -> list (sets sorted when comparable)
+        - `pd.Series` / `pd.DataFrame`    -> dict (index / column labels kept as keys)
+        - `pd.Index`                      -> list
+        - `Path`                          -> str
+        - `bytes` / `bytearray`           -> UTF-8 str
+        - `Decimal`                       -> float,  `complex` -> [real, imag]
+        - `datetime` / `date` / `time` / `pd.Timestamp` / `np.datetime64`
+                                          -> ISO-8601 str
+        - `timedelta` / `np.timedelta64`  -> total seconds (float)
+        - `None` / `pd.NA` / `pd.NaT`     -> None
+
+    - nan_to_none : bool, default True
+        Map NaN and +-inf to `None` (JSON `null`). Set False to keep them as
+        Python floats, in which case `json.dumps` writes the non-standard
+        `NaN` / `Infinity` literals and raises with `allow_nan=False`.
+
+    Returns
+    -------
+    - Any
+        A tree of dict / list / str / int / float / bool / None.
+
+    Notes
+    -----
+    - JSON has no tuple or set, so `tuple` -> `list` is not round-trip safe;
+      set element order is arbitrary unless the elements are mutually comparable.
+    - Keys that do not end up as str / int / float / bool / None are stringified,
+      so two distinct keys can collide into one (e.g. `1.0` and `"1.0"`).
+    - Objects of any other type are returned untouched and may still be unserializable; 
+    the input is assumed to be a finite tree (cycles recurse until `RecursionError`).
+    '''
+    ## leaf types that are already JSON-safe -------------------------------
+
+    if data is None or data is pd.NA or data is pd.NaT:
+        return None
+
+    if isinstance(data, (str, bool)):  # before int: bool is an int subclass
+        return data
+
+    if isinstance(data, float):
+        if math.isfinite(data):
+            return data
+        return None if nan_to_none else data
+
+    if isinstance(data, int):
+        return data
+
+    ## numpy scalars -------------------------------------------------------
+
+    if isinstance(data, np.datetime64):
+        return to_json_compatible(pd.Timestamp(data), nan_to_none)  # .item() drops to int at ns resolution
+
+    if isinstance(data, np.timedelta64):
+        return to_json_compatible(pd.Timedelta(data), nan_to_none)
+
+    if isinstance(data, np.generic):  # np.int64, np.float32, np.bool_, np.str_, ...
+        return to_json_compatible(data.item(), nan_to_none)
+
+    ## containers ----------------------------------------------------------
+    
+    if isinstance(data, dict):
+        def _as_key(key):
+            k = to_json_compatible(key, nan_to_none)
+            if k is None or isinstance(k, (str, bool, int)) or (isinstance(k, float) and math.isfinite(k)):
+                return k
+            return str(k)
+
+        return { _as_key(k): to_json_compatible(v, nan_to_none) for k, v in data.items() }
+
+    if isinstance(data, np.ndarray):
+        if data.dtype.kind in "mM":  # datetime64 / timedelta64: .tolist() drops to ints
+            return (
+                to_json_compatible(data[()], nan_to_none) if data.ndim == 0 
+                else [ to_json_compatible(item, nan_to_none) for item in data ]
+            )
+        return to_json_compatible(data.tolist(), nan_to_none)  # object arrays still hold Python objects
+
+    if isinstance(data, (list, tuple)):
+        return [ to_json_compatible(item, nan_to_none) for item in data ]
+
+    if isinstance(data, (set, frozenset)):
+        try:
+            items = sorted(data)
+        except TypeError:  # mutually incomparable element types
+            items = list(data)
+        return [ to_json_compatible(item, nan_to_none) for item in items ]
+
+    if isinstance(data, pd.DataFrame):
+        return to_json_compatible(data.to_dict(), nan_to_none)  # {column: {index: value}}
+
+    if isinstance(data, pd.Series):
+        return to_json_compatible(data.to_dict(), nan_to_none)  # {index: value}
+
+    if isinstance(data, pd.Index):
+        return to_json_compatible(data.tolist(), nan_to_none)
+
+    ## remaining stdlib leaf types ----------------------------------------
+    
+    if isinstance(data, (dt.datetime, dt.date, dt.time)):  # covers pd.Timestamp
+        return data.isoformat()
+
+    if isinstance(data, dt.timedelta):  # covers pd.Timedelta
+        return data.total_seconds()
+
+    if isinstance(data, Path):
+        return str(data)
+
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data).decode("utf-8", errors="replace")  # lossy for non-UTF-8 payloads
+
+    if isinstance(data, Decimal):
+        return to_json_compatible(float(data), nan_to_none)
+
+    if isinstance(data, complex):
+        return [to_json_compatible(data.real, nan_to_none), to_json_compatible(data.imag, nan_to_none)]
+
+    return data
