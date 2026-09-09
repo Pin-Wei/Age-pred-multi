@@ -12,14 +12,15 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-import utils; utils.MUTED = 2
+from helpers import train_eval_model
 from predict_ages import Config as OrigConfig
 from predict_ages import parse_args as orig_parse_args
-from predict_ages import tee_output 
+from utils import mute_print, to_json_compatible, tee_output
 
 
 FEAT_SRCS = ["age-preds", "cross-decomp"]
-MODES     = ["only_one", "drop_one", "forward", "backward"]
+MODES     = ["only_one", "drop_one"]
+# MODES     = ["only_one", "drop_one", "forward", "backward"]
 METRICS   = ["Val_MAE", "Val_R2", "Test_MAE", "Test_R2"]
 
 
@@ -44,7 +45,10 @@ class Config(OrigConfig):
         if self.args.seeds:
             self.seeds = list(self.args.seeds)
         else:
-            self.seeds = [self.seed] + np.random.randint(0, 100, size=self.args.n_seeds - 1).tolist()
+            rng = np.random.default_rng()
+            arr = np.arange(0, 10000)
+            arr = arr[arr != self.seed]
+            self.seeds = [self.seed] + rng.choice(arr, size=self.args.n_seeds - 1, replace=False).tolist()
 
         self.impute_data = self.args.impute_data
 
@@ -63,14 +67,18 @@ class Config(OrigConfig):
             "cross-decomp": r"^(?P<block>.+)_PLS\d+$"          # k columns per block
         }[self.feat_src]
 
-        out_dir = self.lv2_res_dir / f"feat_eval_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-        self.imp_out_path  = out_dir / "importance.csv"
-        self.subs_out_path = out_dir / "subsets.csv"
-        self.summ_out_path = out_dir / "summary.json"
-        self.log_out_path  = out_dir / "logs.txt"
-        self.perf_path     = out_dir / "_perf_temp.csv" 
+        out_dir = self.lv2_res_dir / f"eval_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        self.perf_main_path = out_dir / "performance_organized.csv"
+        self.perf_long_path = out_dir / "performance_listed.csv"
+        self.perf_path      = out_dir / "_perf_temp.csv"  # will be deleted
+        self.pred_path_tmpl = out_dir / "predictions_seed-{}.csv"
+        self.summ_path      = out_dir / "summary.json"
+        self.log_path       = out_dir / "logs.txt"
 
     def _latest_lv2_key(self):
+        '''
+        Name of the most recent second-level run folder holding predictions of this model / seed
+        '''
         found = sorted( p.parent.name for p in self.lv1_res_dir.glob(f"{self.model_lv2}_{self.seed}_*/{self.pred_out_path.name}") )
         assert found, f"\nNo '{self.pred_out_path.name}' of a {self.model_lv2} / seed {self.seed} run under {self.lv1_res_dir}"
         return found[-1]
@@ -103,6 +111,13 @@ class Lv2Data:
         '''
         cols = [ c for b in self.orig_order(blocks_selected) for c in self.blocks[b] ]
         return cols, self.df[cols].to_numpy(dtype=np.float32)
+
+    def id_table(self) -> pd.DataFrame:
+        '''
+        Participant identifiers and targets, to be carried by every prediction table
+        '''
+        cols = [ c for c in ["SID", "Age", "Set"] if c in self.df.columns ]
+        return self.df[cols].copy()
 
 
 class Entry(NamedTuple):
@@ -150,6 +165,10 @@ def parse_args(argv: list[str] = None) -> argparse.Namespace:
 
 
 def load_lv2_data(config: Config) -> Lv2Data:
+    '''
+    Read the feature table, group its columns into blocks by `config.block_pattern`,
+    and bring in "Age" / "Set" from the preprocessed table when the features lack them.
+    '''
     df = pd.read_csv(config.feat_tbl_path)
     print(f"\nFrom: {config.feat_tbl_path}")
 
@@ -177,7 +196,11 @@ def load_lv2_data(config: Config) -> Lv2Data:
 
 def evaluate_subset(blocks_selected: list[str], data: Lv2Data, config: Config, cache: dict) -> dict:
     '''
-    Fit a second-level model on the columns of `blocks_selected` and score it, once per seed.
+    Fit a second-level model on the columns of `blocks_selected` once per seed, 
+    and save their predictions and performance scores into a record.
+
+    The record is also saved in `cache` with `frozenset(blocks_selected)` as key
+    If the key is found in cache, load the record back instead of re-produce it.
     '''
     blocks_selected = data.orig_order(blocks_selected)
     key = frozenset(blocks_selected)  # an immutable and hashable version of a standard set
@@ -186,32 +209,35 @@ def evaluate_subset(blocks_selected: list[str], data: Lv2Data, config: Config, c
         return cache[key]
 
     cols, X = data.get_subset(blocks_selected)
-    runs, perfs = [], {}
+    runs, perfs, preds, preds_ac = [], {}, {}, {}
 
-    for seed in config.seeds:
-        t_0 = time.perf_counter()
-        utils.train_eval_model(  # bare call, and then load performance metrics back through 'model_perf_path'
-            X, data.y, data.idx_tr, data.idx_te,
-            model_type=config.model_lv2,
-            seed=seed,
-            seed_inner=config.seed_inner,
-            n_folds=config.n_folds,
-            l1_ratios=config.l1_ratios,
-            alphas=config.alphas,
-            max_iter=config.max_iter,
-            n_jobs=config.n_jobs,
-            verbose=config.verbose,
-            impute_data=config.impute_data,
-            model_perf_path=config.perf_path
-        )
+    for seed in config.seeds:  # evaluate with different seeds
+        with mute_print(2):
+            pred_y, y_pred_ac, _ = train_eval_model(
+                X, data.y, data.idx_tr, data.idx_te,
+                model_type=config.model_lv2,
+                seed=seed,
+                seed_inner=config.seed_inner,
+                n_folds=config.n_folds,
+                l1_ratios=config.l1_ratios,
+                alphas=config.alphas,
+                max_iter=config.max_iter,
+                n_jobs=config.n_jobs,
+                verbose=config.verbose,
+                impute_data=config.impute_data,
+                apply_correction=True,
+                model_perf_path=config.perf_path
+            )
+
         perfs[seed] = pd.read_csv(config.perf_path, index_col="Split")
+        preds[seed] = pred_y
+        preds_ac[seed] = y_pred_ac
         runs.append({
             "Seed"    : seed,
             "Val_MAE" : perfs[seed].loc["Val_pooled", "MAE"],
             "Val_R2"  : perfs[seed].loc["Val_pooled", "R2"],
             "Test_MAE": perfs[seed].loc["Test", "MAE"],
-            "Test_R2" : perfs[seed].loc["Test", "R2"],
-            "Seconds" : time.perf_counter() - t_0
+            "Test_R2" : perfs[seed].loc["Test", "R2"]
         })
 
     runs_df = pd.DataFrame(runs)
@@ -220,21 +246,25 @@ def evaluate_subset(blocks_selected: list[str], data: Lv2Data, config: Config, c
         "Columns"    : cols,
         "N_blocks"   : len(blocks_selected),
         "N_feats"    : len(cols),
-        "Runs"       : runs,
-        "Seconds"    : float(runs_df["Seconds"].sum()),
-        "Performance": { s: p.to_dict(orient="index") for s, p in perfs.items() },
-        **{ k: float(runs_df[k].mean()) for k in config.metrics },
-        **{ f"{k}_SD": float(runs_df[k].std(ddof=1)) if len(runs) > 1 else np.nan for k in config.metrics }
+        "Runs"       : runs,  # [{seed + key information in performance table}, ...]
+        "Performance": { s: p.to_dict(orient="index") for s, p in perfs.items() },  # {seed: {full performance table to dict}, ...}
+        "Preds"      : preds,  # {seed: predicted ages aligned with data.df's rows}; dropped before the summary is dumped
+        "Preds_AC"   : preds_ac,  # the same, age-corrected; dropped alongside "Preds"
+        **{ k: float(runs_df[k].mean()) for k in config.metrics },  # average across runs
+        **{ f"{k}_SD": float(runs_df[k].std(ddof=1)) if len(runs) > 1 else np.nan for k in config.metrics }  # SD among runs
     }
     cache[key] = record
 
-    print(", ".join([ f"{k} = {record[k]:.3f}" for k in config.metrics ]))
-    print(f"{len(cols)} feature(s), elapsed time: {record['Seconds']:.1f} sec")
+    print(f"{len(cols)} feature(s); " + ", ".join([ f"{k} = {record[k]:.3f}" for k in config.metrics ]))
 
     return record
 
 
 def run_ablation(mode: str, data: Lv2Data, evaluate) -> list[Entry]:
+    '''
+    For mode "drop_one", score the subset without the block over all `data.block_names`
+    For mode "only_one", score the subset with only the block ...
+    '''
     entries = []
 
     for i, block in enumerate(data.block_names, start=1):
@@ -253,6 +283,10 @@ def run_ablation(mode: str, data: Lv2Data, evaluate) -> list[Entry]:
 
 
 def run_stepwise(mode: str, data: Lv2Data, evaluate, config: Config) -> list[Entry]:
+    '''
+    For mode "forward", greedily add the block that helps most, one per step.
+    For mode "backward", greedily drop the block that hurts least, one per step.
+    '''
     def _move(chosen: list[str], block: str) -> list[str]:
         if mode == "forward":
             return data.orig_order(chosen + [block])
@@ -288,14 +322,20 @@ def run_stepwise(mode: str, data: Lv2Data, evaluate, config: Config) -> list[Ent
     return entries
 
 
-def make_importance_table(entries: list[Entry], full_rec: dict, config: Config) -> pd.DataFrame:
-    entries = [ Entry("full", "(all)", None, full_rec), *entries ]  # a local list; the caller's stays untouched
+def make_organized_table(entries: list[Entry], full_rec: dict, config: Config) -> pd.DataFrame:
+    '''
+    Prepend `full_rec` as a "full" `Entry` in `entries`, 
+    then flatten each entry's record into one row: 
+    its identity, subset sizes, metrics with SDs, and score delta against `full_rec`. 
+    Rank the rows within each mode, and sort by (mode, rank).
+    '''
+    entries = [ Entry("full", "(all)", None, full_rec), *entries ] 
     delta_col = f"d{config.score_by}"
-    imp_dicts = []
+    out_dicts = []
 
     for entry in entries:
         r = entry.record
-        imp_dicts.append({
+        out_dicts.append({
             "Mode"    : entry.mode,
             "Block"   : entry.block,
             "Step"    : entry.step,
@@ -307,35 +347,70 @@ def make_importance_table(entries: list[Entry], full_rec: dict, config: Config) 
             "Blocks"  : " + ".join(r["Blocks"])
         })
 
-    imp_df = pd.DataFrame(imp_dicts)
+    out_df = pd.DataFrame(out_dicts)
 
-    imp_df["Rank"] = imp_df["Step"]  # stepwise modes are ranked by construction; forward picks the best first
-    of_backward = (imp_df["Mode"] == "backward")  # but backward drops the least useful first, so reverse it
-    if of_backward.any():
-        steps = imp_df.loc[of_backward, "Step"]
-        imp_df.loc[of_backward, "Rank"] = steps.max() + 1 - steps
+    out_df["Rank"] = out_df["Step"]  # stepwise modes are ranked by construction; forward picks the best first
+    
+    rids_bw = (out_df["Mode"] == "backward")  # row indices for backward mode
+    if rids_bw.any():
+        steps = out_df.loc[rids_bw, "Step"]
+        out_df.loc[rids_bw, "Rank"] = steps.max() + 1 - steps  # backward drops the least useful first, so reverse it
 
-    for mode, ascending in [("drop_one", False), ("only_one", True)]:  # rank ablation modes by loss
-        of_mode = (imp_df["Mode"] == mode)
-        imp_df.loc[of_mode, "Rank"] = imp_df.loc[of_mode, delta_col].rank(ascending=ascending, method="first")
+    for mode, ascending in [("drop_one", False), ("only_one", True)]:
+        rids = (out_df["Mode"] == mode)
+        out_df.loc[rids, "Rank"] = out_df.loc[rids, delta_col].rank(ascending=ascending, method="first")  # rank ablation modes by loss
 
-    imp_df[["Step", "Rank"]] = imp_df[["Step", "Rank"]].astype("Int64")
+    out_df[["Step", "Rank"]] = out_df[["Step", "Rank"]].astype("Int64")
 
     mode_levels = ["full", *config.modes]  # "full" first, then the modes as configured
-    imp_df["Mode"] = pd.Categorical(imp_df["Mode"], categories=mode_levels, ordered=True)
+    out_df["Mode"] = pd.Categorical(out_df["Mode"], categories=mode_levels, ordered=True)
 
-    return imp_df.sort_values(["Mode", "Rank"], kind="stable").reset_index(drop=True)
+    return out_df.sort_values(["Mode", "Rank"], kind="stable").reset_index(drop=True)
+
+
+def make_pred_tables(entries: list[Entry], full_rec: dict, data: Lv2Data, config: Config) -> dict[int, pd.DataFrame]:
+    '''
+    For each refitting seed,
+    initialize a table with participants' identifiers ("SID", "Age", and "Set"),
+    loop over `entries` (with `full_rec` prepended)
+    and save the model's raw predictions ("Age_*") into a column
+    and age-bias corrected ones into another ("C-Age_*")
+    (named by `_make_col_name` based on the mode and evaluated subset).
+    '''
+    def _make_col_name(entry: Entry) -> str:
+        if entry.mode == "full":
+            return "Age_full"
+        if entry.step is None:  # the ablation modes
+            mode_name = {'only_one': 'only', 'drop_one': 'drop'}[entry.mode]
+            return f"Age_{mode_name}_{entry.block}"
+        return f"Age_{entry.mode}_step-{entry.step:02d}_{entry.block}"  # the stepwise modes may revisit a block
+
+    entries = [ Entry("full", "(all)", None, full_rec), *entries ]
+    out_dict = {}
+
+    for seed in config.seeds:
+        df = data.id_table()
+
+        for entry in entries:
+            col = _make_col_name(entry)
+            df[col] = entry.record["Preds"][seed]
+            df[f"C-{col}"] = entry.record["Preds_AC"][seed]
+
+        out_dict[seed] = df
+
+    return out_dict
 
 
 def main(config: Config):
-    config.imp_out_path.parent.mkdir(parents=True, exist_ok=True)
+    config.summ_path.parent.mkdir(parents=True, exist_ok=True)  # every output of this run lands in that one folder
     
+    ## Load data as Lv2Data 
     data = load_lv2_data(config)
+
+    ## Initialize `cache` and callable function `evaluate`
     cache = {}
     evaluate = lambda sel: evaluate_subset(sel, data, config, cache)  # Callable[[list[str]], dict]
     
-    t_0 = time.perf_counter()
-
     print(f"\nFit the reference {config.model_lv2} model on all {len(data.block_names)} blocks ...")
     full_rec = evaluate(data.block_names)
 
@@ -348,52 +423,66 @@ def main(config: Config):
 
     config.perf_path.unlink(missing_ok=True)  # delete file
 
-    imp_df = make_importance_table(entries, full_rec, config)
-    imp_df.to_csv(config.imp_out_path, index=False)
-    print(f"\nSaved: {config.imp_out_path}\n")
+    ## Organize the full/ablation/stepwise evaluation records into ranked table and save it
+    df_organized = make_organized_table(entries, full_rec, config)
+    df_organized.to_csv(config.perf_main_path, index=False)
+    print(f"\nSaved: {config.perf_main_path}\n")
 
-    subs_df = pd.DataFrame([ {
+    ## Save the records that are not collapsed over seeds
+    df_listed = pd.DataFrame([ {
             "Blocks": " + ".join(record["Blocks"]), 
             "N_blocks": record["N_blocks"], 
             "N_feats": record["N_feats"], 
             **runs
         } for record in cache.values() for runs in record["Runs"]
     ])
-    subs_df.to_csv(config.subs_out_path, index=False)
-    print(f"Saved: {config.subs_out_path}\n")
+    df_listed.to_csv(config.perf_long_path, index=False)
+    print(f"Saved: {config.perf_long_path}\n")
 
+    ## Save predictions 
+    pred_dfs = make_pred_tables(entries, full_rec, data, config)
+    n_id_cols = len(data.id_table().columns)
+    for seed, pred_df in pred_dfs.items():
+        pred_path = Path(str(config.pred_path_tmpl).format(seed))
+        pred_df.to_csv(pred_path, index=False)
+        print(f"Saved: {pred_path} ({(pred_df.shape[1] - n_id_cols) // 2} model(s), raw and corrected)\n")
+
+    ## Save the run's settings, the data it saw, and every evaluated record into one summary
+    keep = lambda record: { k: v for k, v in record.items() if k not in ["Preds", "Preds_AC"] }  # kept in the tables above, not here
     summ_out = {
         **{ k: getattr(config, k) for k in [
-            "feat_src", "feat_tbl_path", "lv2_key", "block_pattern", "modes", "score_by", "model_lv1", "model_lv2",
-            "n_folds", "seeds", "seed_inner", "l1_ratios", "alphas", "max_iter", "impute_data"
+            "feat_src", "lv2_key", "feat_tbl_path", "block_pattern", "modes", "score_by", 
+            "model_lv1", "model_lv2", "n_folds", "seeds", "seed_inner", "l1_ratios", "alphas", "max_iter", "impute_data"
         ] },
         "n_participants": len(data.df),
         "n_train"       : len(data.idx_tr),
         "n_test"        : len(data.idx_te),
-        "n_fits"        : len(subs_df),
-        "seconds"       : time.perf_counter() - t_0,
+        "n_fits"        : len(df_listed),  # one fit per (distinct subset, seed) pair
         "blocks"        : data.blocks,
-        "full"          : full_rec,
-        "importance"    : imp_df.to_dict(orient="records"),
-        "subsets"       : list(cache.values())
+        "full"          : keep(full_rec),
+        "importance"    : df_organized.to_dict(orient="records"),
+        "subsets"       : [ keep(record) for record in cache.values() ]
     }
-    with open(config.summ_out_path, "w") as f:
-        json.dump(utils.to_json_compatible(summ_out), f, allow_nan=False)
-    print(f"Saved: {config.summ_out_path}\n")
+    with open(config.summ_path, "w") as f:
+        json.dump(to_json_compatible(summ_out), f, allow_nan=False)
+    print(f"Saved: {config.summ_path}\n")
 
+    ## Print the ranked table, one section per mode
     shown = ["Rank", "Block", "N_blocks", "N_feats", *config.metrics, f"d{config.score_by}"]
-    for mode in imp_df["Mode"].unique():
-        print(f"\n{mode}\n{imp_df[imp_df['Mode'] == mode][shown].to_string(index=False, float_format='%.3f')}")
+    for mode in df_organized["Mode"].unique():
+        print(f"\n{mode}\n{df_organized[df_organized['Mode'] == mode][shown].to_string(index=False, float_format='%.3f')}")
     print()
 
 
 if __name__ == "__main__":
     config = Config(parse_args())
-    log_path = Path(config.log_out_path)
+    log_path = Path(config.log_path)
 
     with tee_output(log_path):
         print(f"\nStart at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        t_0 = time.perf_counter()
         main(config)
-        print(f"\nFinish at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        elapsed = time.perf_counter() - t_0
+        print(f"\nFinish at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}, elapsed time: {elapsed:.1f} sec")
 
     print(f"\nDone! logs is saved to: {log_path}")
