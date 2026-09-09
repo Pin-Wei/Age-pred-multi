@@ -3,6 +3,7 @@
 
 data/*
 etc/licenses/
+figures/
 models/
 results/
 scripts/.env
