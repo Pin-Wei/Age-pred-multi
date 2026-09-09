@@ -4,9 +4,6 @@
 import argparse
 import json
 import os
-import subprocess
-import sys
-from contextlib import contextmanager
 from datetime import datetime
 from itertools import product
 from pathlib import Path
@@ -14,7 +11,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from utils import print_missing, get_tbss_processed, load_feat_table, train_eval_model, to_json_compatible
+from helpers import print_missing, get_tbss_processed, load_feat_table, train_eval_model 
+from utils import to_json_compatible, tee_output
 
 
 MODELS    = ["elasticnet", "ridge"]
@@ -53,7 +51,7 @@ class Config:
         lv2_key = f"{self.model_lv2}_{self.seed}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         self.lv2_mdl_dir = self.lv1_mdl_dir / lv2_key
         self.lv2_res_dir = self.lv1_res_dir / lv2_key
-        self.pred_out_path = self.lv2_res_dir / "all_preds.csv"
+        self.pred_out_path = self.lv2_res_dir / "predictions.csv"
         self.summ_out_path = self.lv2_res_dir / "summary.json"
         self.log_out_path  = self.lv2_res_dir / "logs.txt"
 
@@ -109,7 +107,7 @@ class Config:
         feat_name_2_affix = {
             "DTI_FA"    : f"dti_fa{tbss_key}", 
             "DTI_MD"    : f"dti_md{tbss_key}", 
-            "DTI_ROI"   : "dti_roi-means", 
+            # "DTI_ROI"   : "dti_roi-means", 
             "rs-EEG_PSD": "rs-eeg_psd", 
             "rs-MRI_FC" : "rs-fmri_fc", 
             "MRI_ROI"   : "t1w_roi-means"
@@ -135,57 +133,29 @@ class Config:
             elif f_name in preproc_f_names:
                 self.tbl_paths[f_name] = self.df_preproc_path
             else:
-                self.tbl_paths[f_name] = self.tbl_dir / f"df_{affix}.csv" 
-            self.model_paths[f_name]   = self.lv1_mdl_dir / f"{affix}_{{}}.joblib"
-            self.perf_paths[f_name]    = self.lv1_res_dir / f"{affix}.csv"
+                self.tbl_paths[f_name] = self.tbl_dir / f"df_{affix}.csv"
+
+            self.model_paths[f_name] = self.lv1_mdl_dir / f"{affix}_{{}}.joblib"
+            self.perf_paths[f_name]  = self.lv1_res_dir / f"{affix}.csv"
 
         self.lv2_model_path = self.lv2_mdl_dir / f"pipeline_{{}}.joblib"
         self.lv2_perf_path  = self.lv2_res_dir / f"performance.csv"
+        self.lv2_calib_path = self.lv2_res_dir / f"age-correction_params.csv"
 
-
-@contextmanager
-def tee_output(log_path: Path):
-    '''
-    Duplicate stdout/stderr to both the terminal and `log_path`.
-
-    Redirection happens at the file-descriptor level, 
-    so it also captures output from C extensions and joblib/loky workers, not just `print`.
-    '''
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    sys.stdout.flush()  # clears the internal memory 
-    sys.stderr.flush()
-
-    proc = subprocess.Popen(["tee", str(log_path)], stdin=subprocess.PIPE)
-    saved_fds = (os.dup(1), os.dup(2))  # file descriptors
-    os.dup2(proc.stdin.fileno(), 1)
-    os.dup2(proc.stdin.fileno(), 2)
-    was_line_buffered = sys.stdout.line_buffering
-    sys.stdout.reconfigure(line_buffering=True)  # keep ordering vs. stderr / workers
-    
-    try:
-        yield
-
-    finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        sys.stdout.reconfigure(line_buffering=was_line_buffered)
-        os.dup2(saved_fds[0], 1)
-        os.dup2(saved_fds[1], 2)
-        for fd in saved_fds:
-            os.close(fd)
-        proc.stdin.close()
-        proc.wait()
-
-
-def parse_args(argv: list[str] = None,
-               parser: argparse.ArgumentParser = None,
-               defaults: dict = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] = None, 
+    parser: argparse.ArgumentParser = None, 
+    defaults: dict = None
+) -> argparse.Namespace:
     '''
     Command-line overrides for the Config values worth varying between runs.
 
-    A downstream script sharing this Config passes its own `parser`, already holding its extra
-    options, so that these options are added to it rather than to a fresh one. It may also pass
-    `defaults` to replace the ones set below, which `argv` still overrides.
+    A downstream script sharing this Config passes its own `parser`, 
+    already holding its extra options, 
+    so that these options are added to it rather than to a fresh one. 
+    
+    It may also pass `defaults` to replace the ones set below, 
+    which `argv` still overrides.
     '''
     parser = parser or argparse.ArgumentParser(
         description="Train and evaluate the two-level age-prediction pipeline.",
@@ -234,17 +204,17 @@ def load_data(f_name: str, config: Config) -> tuple[np.ndarray, np.ndarray | pd.
     if f_name == "DTI_FA":
         X = get_tbss_processed(
             img_path=config.fa_4d_path, 
-            mask_path=config.fa_mask_path, 
             N=len(X_subjs), 
             stride=config.downsmple, 
+            mask_path=config.fa_mask_path, 
             cache=config.fa_npy_path
         )
     elif f_name == "DTI_MD":
         X = get_tbss_processed(
             img_path=config.md_4d_path, 
-            mask_path=config.fa_mask_path, 
             N=len(X_subjs), 
             stride=config.downsmple, 
+            mask_path=config.fa_mask_path, 
             cache=config.md_npy_path
         )
     elif f_name in config.sel_feats_by_name.keys():
@@ -272,7 +242,7 @@ def run_lv1_models(subj_df: pd.DataFrame, config: Config) -> tuple[list[pd.DataF
         idx_te = np.where(sets == "test")[0]
 
         print(f"\nTrain and eval {config.model_lv1} models on {f_name} features ...")
-        y_pred, fold_n = train_eval_model(
+        y_pred, _, fold_n = train_eval_model(  # no age-bias correction on this level
             X, ages, idx_tr, idx_te, 
             model_type=config.model_lv1, 
             seed=config.seed, 
@@ -325,20 +295,20 @@ def merge_preds(subj_df: pd.DataFrame, pred_by_feat: list[pd.DataFrame]) -> pd.D
     return pred_out
 
 
-def add_pymnet_results(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) -> tuple[pd.DataFrame, dict]:
-    f_name = "Pymnet"
+def add_pyment_results(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) -> tuple[pd.DataFrame, dict]:
+    f_name = "Pyment"
     config.feat_types.append(f_name)
 
-    pymnet_df = pd.read_csv(config.pyment_tbl_path, usecols=["subject", "age"])
-    pymnet_df.insert(0, "SID", pymnet_df["subject"].map(lambda x: f"sub-{x:04d}").values)
-    data_subjs = pymnet_df["SID"].values
-    pymnet_df.drop(columns=["subject"], inplace=True)
-    pymnet_df.rename(columns={"age": f"Age_{f_name}"}, inplace=True)
-    pymnet_df[f"Fold_{f_name}"] = -1  # used publicly available pre-trained model
-    pred_out = pd.merge(pred_out, pymnet_df, on="SID", how="left")    
+    pyment_df = pd.read_csv(config.pyment_tbl_path, usecols=["subject", "age"])
+    pyment_df.insert(0, "SID", pyment_df["subject"].map(lambda x: f"sub-{x:04d}").values)
+    data_subjs = pyment_df["SID"].values
+    pyment_df.drop(columns=["subject"], inplace=True)
+    pyment_df.rename(columns={"age": f"Age_{f_name}"}, inplace=True)
+    pyment_df[f"Fold_{f_name}"] = -1  # used publicly available pre-trained model
+    pred_out = pd.merge(pred_out, pyment_df, on="SID", how="left")    
     missing = print_missing(pred_out["SID"].values, data_subjs)
 
-    temp_df = pd.merge(pymnet_df, pred_out.loc[:, ["SID", "Age"]], on="SID", how="left")
+    temp_df = pd.merge(pyment_df, pred_out.loc[:, ["SID", "Age"]], on="SID", how="left")
     y = temp_df["Age"].values
     y_pred = temp_df[f"Age_{f_name}"].values
     err = y - y_pred
@@ -363,26 +333,29 @@ def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) ->
     idx_te = np.where(sets == "test")[0]
 
     print(f"\nTrain and eval the final {config.model_lv2} model on the {len(lv1_age_cols)} predicted ages ...")
-    y_pred, _ = train_eval_model(
-        pred_out[lv1_age_cols].astype(np.float32),  # named, so the fitted model keeps the block names
-        pred_out["Age"].to_numpy(dtype=np.float32),
-        idx_tr,
-        idx_te,
-        model_type=config.model_lv2, 
-        seed=config.seed, 
-        seed_inner=config.seed_inner, 
-        n_folds=1, 
-        l1_ratios=config.l1_ratios, 
-        alphas=config.alphas, 
-        max_iter=config.max_iter, 
-        n_jobs=config.n_jobs, 
-        verbose=config.verbose, 
-        impute_data=True, 
-        model_path_template=config.lv2_model_path, 
-        model_perf_path=config.lv2_perf_path, 
+    y_pred, y_pred_ac, _ = train_eval_model(
+        X=pred_out[lv1_age_cols].astype(np.float32), 
+        y=pred_out["Age"].to_numpy(dtype=np.float32),
+        idx_tr=idx_tr,
+        idx_te=idx_te,
+        model_type=config.model_lv2,
+        seed=config.seed,
+        seed_inner=config.seed_inner,
+        n_folds=config.n_folds, 
+        l1_ratios=config.l1_ratios,
+        alphas=config.alphas,
+        max_iter=config.max_iter,
+        n_jobs=config.n_jobs,
+        verbose=config.verbose,
+        impute_data=True,
+        apply_correction=True,
+        model_path_template=config.lv2_model_path,
+        model_perf_path=config.lv2_perf_path,
+        calib_param_path=config.lv2_calib_path, 
         overwrite=config.overwrite_mdl
     )
     pred_out["Age_Final"] = y_pred
+    pred_out["C-Age_Final"] = y_pred_ac
 
     summ_out = {
         "model_lv1"  : config.model_lv1,
@@ -415,7 +388,7 @@ def main(config: Config):
 
     pred_by_feat, summ_by_feat = run_lv1_models(subj_df, config)
     pred_out = merge_preds(subj_df, pred_by_feat)
-    pred_out, summ_by_feat = add_pymnet_results(pred_out, summ_by_feat, config)    
+    pred_out, summ_by_feat = add_pyment_results(pred_out, summ_by_feat, config)    
     pred_out, summ_out = run_lv2_model(pred_out, summ_by_feat, config)
 
     config.pred_out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -437,4 +410,4 @@ if __name__ == "__main__":
         main(config)
         print(f"\nFinish at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    print(f"\nDone! logs is saved to: {log_path}")
+    print(f"\nDone! logs is saved to: {log_path}\n")
