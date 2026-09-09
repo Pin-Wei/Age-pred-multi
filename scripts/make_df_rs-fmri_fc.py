@@ -10,7 +10,7 @@ import pandas as pd
 from nilearn.maskers import NiftiLabelsMasker
 from nilearn.datasets import fetch_atlas_schaefer_2018
 
-from utils import print_missing
+from helpers import print_missing
 
 
 class Config:

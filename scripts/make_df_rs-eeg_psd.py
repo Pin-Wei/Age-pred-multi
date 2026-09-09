@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import mne
 
-from utils import print_missing
+from helpers import print_missing
 
 
 class Config:

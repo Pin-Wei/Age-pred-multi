@@ -9,7 +9,7 @@ import nibabel as nib
 from nilearn.datasets import fetch_atlas_juelich
 from nilearn.image import resample_to_img
 
-from utils import print_missing, load_img_data
+from helpers import print_missing, load_img_data
 
 
 class Config:
