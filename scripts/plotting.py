@@ -248,6 +248,12 @@ def plot_age_scatter(
             ), 
             ha="right", va="bottom", zorder=4
         )
+        ax.legend(
+            loc="upper left", 
+            handlelength=1.2,  # length of the markers; default = 2, in font-size units
+            borderaxespad=.5,  # the distance between the legend and the coordinate axis frame
+            frameon=True, framealpha=.75, edgecolor="none"
+        )
         ax.set(
             xlabel="", ylabel="", title=title, 
             xlim=age_lims, ylim=age_lims, aspect="equal"
