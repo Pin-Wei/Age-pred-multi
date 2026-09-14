@@ -163,9 +163,9 @@ def get_tbss_processed(
 def load_feat_table(
     tbl_path: str | Path,
     prefer_npz: bool = True,
-    usecols: list[str] = None,
-    id_col: str = None
-) -> tuple[np.ndarray, pd.DataFrame]:
+    usecols: list[str] | None = None,
+    id_col: str | None = None
+) -> tuple[list[str], pd.DataFrame]:
     '''
     Load the feature matrix and the participant IDs which it belongs 
     from `tbl_path` (can be a CSV file or a NPZ file).
@@ -194,35 +194,33 @@ def load_feat_table(
     def _load_from_npz():
         with np.load(tbl_path, allow_pickle=True) as dat:
             if usecols is not None:
-                if "feats" not in dat:
-                    raise ValueError("'usecols' needs the feature names, but the NPZ file has no 'feats' key.")
-
+                assert "feats" in dat, "'usecols' needs the feature names, but the NPZ file has no 'feats' key"
                 sel = np.isin(dat["feats"], usecols)  # boolean mask
                 X = dat["X"][:, sel].astype(np.float32)
-                feats = dat["feats"][sel].tolist()
+                feat_list = dat["feats"][sel].tolist()
                 return (
-                    dat["SID"][sel], 
-                    pd.DataFrame(X, columns=feats)
+                    dat["SID"], 
+                    pd.DataFrame(X, columns=feat_list)
                 )
             else:
                 if "feats" not in dat:
                     custom_print(f"{tbl_path.name} has no 'feats' key; naming its columns positionally ('col-0', ...).")
-                    feats = [ f"col-{i}" for i in range(dat["X"].shape[1]) ]
+                    feat_list = [ f"col-{i}" for i in range(dat["X"].shape[1]) ]
                 else:
-                    feats = dat["feats"].tolist()
+                    feat_list = dat["feats"].tolist()
                 return (
                     dat["SID"], 
-                    pd.DataFrame(dat["X"].astype(np.float32), columns=feats)
+                    pd.DataFrame(dat["X"].astype(np.float32), columns=feat_list)
                 )
 
     def _load_from_csv():
         nonlocal id_col
         df = pd.read_csv(tbl_path, usecols=usecols)
         id_col = df.columns.tolist()[0] if id_col is None else id_col
-        feats = [ c for c in df.columns if c != id_col ]
+        feat_list = [ c for c in df.columns if c != id_col ]
         return (
-            df[id_col].to_numpy(), 
-            df.loc[:, feats].astype(np.float32)
+            df[id_col].to_numpy(),  # convert into a np.array to use fancy indexing 
+            df.loc[:, feat_list].astype(np.float32)
         )
 
     tbl_path = Path(tbl_path)
@@ -234,19 +232,19 @@ def load_feat_table(
         tbl_path = tbl_path.with_suffix(".npz")
     
     if tbl_path.suffix.lower() == ".npz" and tbl_path.exists():
-        subjs, X = _load_from_npz()
+        subj_arr, X = _load_from_npz()
     else:
         tbl_path = tbl_path.with_suffix(".csv")
-        subjs, X = _load_from_csv()
+        subj_arr, X = _load_from_csv()
 
     keep = X.notna().all(axis=1).to_numpy()
-    subjs = subjs[keep]
+    subj_list = subj_arr[keep].tolist() 
     X = X[keep].reset_index(drop=True)
 
     custom_print(f"From: {tbl_path.name}")
-    custom_print(f"{len(subjs)} participants, {X.shape[1]} features")
+    custom_print(f"{len(subj_list)} participants, {X.shape[1]} features")
 
-    return subjs, X
+    return subj_list, X
 
 
 def train_eval_model(
