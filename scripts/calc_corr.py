@@ -2,6 +2,7 @@
 
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -11,14 +12,15 @@ import pingouin as pg
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
 
+from predict_ages import SID, SET, AGE
 from plotting import sig_stars
 
 
 DATA_SETS = ["all", "test", "train"]
 METHODS = ["pearson", "spearman"]  # any valid option for: https://pingouin-stats.org/generated/pingouin.partial_corr.html
 PAD_OPTIONS = { 
-    "ac" : "use age-corrected predictions ('C-Age_*'), so the effect of age is already taken into account",
-    "pa" : "use the original predictions ('Age_*'), with age as a covariate when calculating the correlation(s)",
+    "ac" : f"use age-corrected predictions ('C-{AGE}_*'), so the effect of age is already taken into account",
+    "pa" : f"use the original predictions ('{AGE}_*'), with age as a covariate when calculating the correlation(s)",
     "raw": "just use the the original predictions"
 }
 FDR_SCOPES = ["figure", "model"]  # the family the point-level p values are corrected within
@@ -32,17 +34,19 @@ class Config:
 
     def setup_vars(self, args):
         self.score_name = "ST"
-        self.score_key = "_ST_SCALED_"
         self.data_set = DATA_SETS[args.data_set]
         self.method = METHODS[args.method]
         self.pad_type = list(PAD_OPTIONS.keys())[args.pad_type]
+        self.drop_sum_scores = args.drop_sum_scores
         self.partial_score = args.partial_score
         self.fdr_alpha = args.fdr_alpha
         self.fdr_scope = FDR_SCOPES[args.fdr_scope]
 
     def setup_paths(self, args):
         self.proj_root = Path(__file__).resolve().parents[1]
-        self.full_tbl_path = self.proj_root / "data" / "tabular" / "df_merged.csv"
+        tbl_dir = self.proj_root / "data" / "tabular"
+        self.scores_df_path   = tbl_dir / f"df_scores_{self.score_name}.csv"
+        self.scores_json_path = tbl_dir / "cog_scores.json"
 
         self.eval_dir = Path(args.eval_dir) if args.eval_dir else self._latest_eval_dir()
         # a folder that is not there and one that holds no tables fail differently: the
@@ -53,8 +57,8 @@ class Config:
         self.preds_paths = sorted(self.eval_dir.glob("predictions_seed-*.csv"))
         assert self.preds_paths, f"\nNo 'predictions_seed-*.csv' under {self.eval_dir}\n"
 
-        pad_name = f"pad-{self.pad_type}" if self.pad_type != "raw" else "pad"
-        score_name = f"{self.score_name}-pa" if self.partial_score else self.score_name
+        pad_name = "pad" + (f"-{self.pad_type}" if self.pad_type != "raw" else "")
+        score_name = self.score_name + ("-noSum" if self.drop_sum_scores else "") + ("-pa" if self.partial_score else "")
         self.out_dir = self.eval_dir / f"{pad_name}_x_{score_name} ({self.method})"
         self.long_out_path  = self.out_dir / f"long_{self.data_set}.csv"
         self.mae_summ_path  = self.out_dir / f"mae_{self.data_set}.csv"
@@ -81,28 +85,32 @@ def parse_args(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("-o", "--overwrite", action="store_true",
-                        help="overwrite existing outputs")
+                        help="Overwrite existing outputs")
 
     grp_data = parser.add_argument_group("data")
     grp_data.add_argument("-d", "--eval_dir", default=None,
-                          help="folder holding the 'predictions_seed-*.csv' tables; None picks the latest one")
+                          help="The folder holding the 'predictions_seed-*.csv' tables; None picks the latest one")
     grp_data.add_argument("-set", "--data_set", type=int, choices=range(len(DATA_SETS)), default=0, 
-                          help="which participants to correlate over; " + 
+                          help="Which participants to correlate over; " + 
                                ", ".join( f"'{i}': {x}" for i, x in enumerate(DATA_SETS) ))
-    
+    # grp_data.add_argument("-ksum", "--keep_sum_scores", dest="drop_sum_scores", action="store_false",
+    #                       help="Keep the score columns whose name says they sum other columns up")
+    grp_data.add_argument("-dsum", "--drop_sum_scores", action="store_true",
+                          help="Leave out the score columns whose name says they sum other columns up")
+
     grp_corr = parser.add_argument_group("stats")
     grp_corr.add_argument("-m", "--method", type=int, choices=range(len(METHODS)), default=0, 
-                          help="which correlation measure to use; " +
+                          help="Which correlation measure to use; " +
                                ", ".join( f"'{i}': {x}" for i, x in enumerate(METHODS) ))
     grp_corr.add_argument("-pad", "--pad_type", type=int, choices=range(len(PAD_OPTIONS)), default=1, 
-                          help="whether to remove age-related effects from PAD; " +
+                          help="Whether to remove age-related effects from PAD; " +
                                ", ".join( f"'{i}': {v}" for i, v in enumerate(PAD_OPTIONS.values()) ))
     grp_corr.add_argument("-ps", "--partial_score", action="store_true",
-                          help="also residualize the scores on chronological age")
+                          help="Also residualize the scores on chronological age")
     grp_corr.add_argument("-fdr", "--fdr_alpha", type=float, default=.05,
-                          help="FDR-corrected p below which a correlation counts as significant")
+                          help="FDR threshold; the maximum acceptable proportion of false positives among all significant discoveries")
     grp_corr.add_argument("-fs", "--fdr_scope", type=int, choices=range(len(FDR_SCOPES)), default=0, 
-                          help="correct the point-level p values across every model at once (0), or within each model (1)")
+                          help="Correct the point-level p-values across every model at once (0), or within each model (1)")
 
     parser.set_defaults(**(defaults or {}))
 
@@ -119,8 +127,8 @@ def load_preds(config: Config) -> tuple[dict[int, pd.DataFrame], list[str], list
     df_dict = {}
 
     for path in config.preds_paths:
-        df = pd.read_csv(path, index_col="SID")
-        preds_cols = [ c for c in df.columns if c.startswith("Age_") ]
+        df = pd.read_csv(path, index_col=SID)
+        preds_cols = [ c for c in df.columns if c.startswith(f"{AGE}_") ]
 
         assert cols is None or preds_cols == cols, f"\nModel columns of {path.name} differ from the other tables\n"
         cols = preds_cols
@@ -130,7 +138,7 @@ def load_preds(config: Config) -> tuple[dict[int, pd.DataFrame], list[str], list
             assert not missing, f"\nChoose to use age-corrected PAD, but {path.name} carries no 'C-' column for {len(missing)} model(s)."
 
         if config.data_set != "all":
-            df = df[df["Set"] == config.data_set]
+            df = df[df[SET] == config.data_set]
 
         assert sids is None or df.index.equals(sids), f"\nParticipants of {path.name} differ from the other tables\n"
         sids = df.index
@@ -147,20 +155,27 @@ def load_preds(config: Config) -> tuple[dict[int, pd.DataFrame], list[str], list
 
 def load_scores(sids: list[str], config: Config) -> pd.DataFrame:
     '''
-    Read the columns containing the string `config.score_key` 
-    from the file `config.full_tbl_path`, 
+    Read the file `config.scores_df_path`, 
     and return the data of the participants specified with `sid`.
-    '''
-    cols = pd.read_csv(config.full_tbl_path, nrows=0).columns
-    sel_cols = [ c for c in cols if config.score_key in c ]
-    assert sel_cols, f"\nNo column of {config.full_tbl_path.name} holds '{config.score_key}'\n"
-    print(f"\n{len(sel_cols)} columns(s) contains the string '{config.score_key}'")
+    '''   
+    print(f"Loading {config.score_name} scores from: {config.scores_df_path}")
+    df = pd.read_csv(config.scores_df_path, index_col=SID)
 
-    print(f"Loading matched columns(s) from: {config.full_tbl_path}")
-    df = pd.read_csv(config.full_tbl_path, index_col="BASIC_INFO_ID", usecols=["BASIC_INFO_ID", "BASIC_INFO_AGE"] + sel_cols)
-    df = df.rename(columns={"BASIC_INFO_AGE": "Age"})
+    print(f"Loading columns that has been used to calculate the cognitive score from:\n{config.scores_json_path}")
+    cog_data = json.loads(config.scores_json_path.read_text())
 
-    sel_df = df.loc[sids, ["Age"] + sel_cols]
+    sel_cols = []
+    for c in df.columns:
+        if c == AGE:
+            continue
+        if c in cog_data["columns"]:
+            continue
+        if config.drop_sum_scores and ("sum" in c.lower()):
+            continue
+        sel_cols.append(c)
+    print(f"{len(sel_cols)} column(s) kept")
+
+    sel_df = df.loc[sids, [AGE] + sel_cols]
     sel_df = sel_df.apply(pd.to_numeric, errors="coerce")
 
     missing = int(sel_df[sel_cols].isna().all(axis=1).sum())
@@ -183,21 +198,21 @@ def calc_corr(
     '''
     corr_rows, mae_rows = [], []
 
-    age = score_df["Age"]
+    age = score_df[AGE]
     score_cols = list(score_df.columns)
-    score_cols.remove("Age")
+    score_cols.remove(AGE)
 
     covars = (
-        {"covar": "Age"} if (pad_type == "pa") and partial_score
-        else {"y_covar": "Age"} if pad_type == "pa"
-        else {"x_covar": "Age"} if partial_score
+        {"covar": AGE} if (pad_type == "pa") and partial_score
+        else {"y_covar": AGE} if pad_type == "pa"
+        else {"x_covar": AGE} if partial_score
         else {}
     )
 
     for seed, preds_df in preds_df_dict.items():
         for p_col in preds_cols:
             err = preds_df[p_col] - age
-            model = p_col.replace("Age_", "")
+            model = p_col.replace(f"{AGE}_", "")
             mae_rows.append({
                 "Seed": seed, 
                 "Model": model, 
@@ -210,7 +225,7 @@ def calc_corr(
                     data=pd.DataFrame({
                         s_col: score_df[s_col], 
                         model: pad, 
-                        "Age": age
+                        AGE: age
                     }), 
                     x=s_col, 
                     y=model, 

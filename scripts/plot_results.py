@@ -2,10 +2,12 @@
 
 
 import argparse
+import json
 from pathlib import Path
 
 import pandas as pd
 
+from make_df_scores import SCORE_KEY
 from predict_ages import SET, AGE, TARGETS
 import calc_corr
 from summ_results import TARG_COL, FEAT_COL, load_preds
@@ -181,10 +183,12 @@ def main(config: Config):
             )
 
         if "corr_heat" in config.to_draw:
+            # cog_data = json.loads(config.scores_json_path.read_text())
+            # score_key = cog_data["score_key"]
             plot_corr_heat(
                 df=corr_agg_s, 
                 model_order=corr_agg_m.index.to_list(), 
-                score_key=config.score_key, 
+                score_key=SCORE_KEY, 
                 fdr_alpha=config.fdr_alpha, 
                 out_path=config.corr_heat_path, 
                 style=config.style
