@@ -13,6 +13,7 @@ from predict_ages import SID, SET, AGE
 
 
 TARG_COL, FEAT_COL = "Target", "Feature"
+TREE_TARG_NAME = "Importance"  # what the target level says when the weights are tree importances
 
 
 class Config:
@@ -119,7 +120,7 @@ def calc_fits(preds_df: pd.DataFrame, preds_cols: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def load_coefs(lv2_model_paths: list[Path]) -> pd.DataFrame:
+def load_coefs(lv2_model_paths: list[Path]) -> pd.DataFrame | None:
     '''
     Read the weights of the second-level models from each fold.
     '''
@@ -133,8 +134,16 @@ def load_coefs(lv2_model_paths: list[Path]) -> pd.DataFrame:
         model = pipe.named_steps["model"]
         model = getattr(model, "regressor_", model)  # for TransformedTargetRegressor
 
-        coefs = np.atleast_2d(model.coef_)
-        targets = list(getattr(pipe, "target_names_in_", []))
+        if hasattr(model, "coef_"):
+            coefs = np.atleast_2d(model.coef_)
+            targets = list(getattr(pipe, "target_names_in_", []))
+
+        elif hasattr(model, "feature_importances_"):
+            coefs = np.atleast_2d(model.feature_importances_)
+            targets = [TREE_TARG_NAME]
+        else:
+            print(f"\n{path.name} holds a {type(model).__name__}, which carries neither coef_ nor feature_importances_\n")
+            return None
         
         feats = list(getattr(pipe, "feature_names_in_", []))
         assert F is None or set(feats) == set(F), f"\nFeature set in fold-{fold_n} differ from the other cycles\n"
@@ -160,8 +169,9 @@ def main(config: Config):
     print(f"Saved: {config.fits_out_path}\n")
 
     coefs_df = load_coefs(config.lv2_model_paths)
-    coefs_df.to_csv(config.coefs_out_path)
-    print(f"Saved: {config.coefs_out_path}\n")
+    if coefs_df is not None:
+        coefs_df.to_csv(config.coefs_out_path)
+        print(f"Saved: {config.coefs_out_path}\n")
 
 
 if __name__ == "__main__":

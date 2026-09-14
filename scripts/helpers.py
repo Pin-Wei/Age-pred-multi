@@ -12,7 +12,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from utils import custom_print
 
 
-MODEL_TYPES = ["elasticnet", "lasso", "ridge"]
+MODEL_TYPES = ["elasticnet", "lasso", "ridge", "xgboost"]
 L1_RATIOS = [.1, .5, .7, .9, .95, .99, 1]
 ALPHAS = [1e-1, 1.0, 3.0, 1e1, 3e1, 1e2, 3e2, 1e3, 1e4, 1e5]
 
@@ -264,6 +264,8 @@ def train_eval_model(
     l1_ratios: list[float] = L1_RATIOS, 
     alphas: list[float] = ALPHAS, 
     max_iter: int = 10000, 
+    xgb_params: dict = {}, 
+    opt_trials: int = 100, 
     n_jobs: int = -1, 
     verbose: int = 1, 
     impute_data: bool = False,
@@ -301,7 +303,7 @@ def train_eval_model(
 
     model_type : str
         Type of regression algorithm to use. Must be one of `MODEL_TYPES` 
-        (e.g., "elasticnet", "lasso", "ridge").
+        (e.g., "elasticnet", "lasso", "ridge", "xgboost").
 
     seed : int, default=42
         Random seed for the outer cross-validation splits on `idx_tr`.
@@ -321,6 +323,12 @@ def train_eval_model(
 
     max_iter : int, default=10000
         Maximum number of iterations for the linear solvers.
+
+    xgb_params : dict, optional
+        Custom hyperparameters for XGBoost models.
+
+    opt_trials : int, default=100
+        Number of Optuna trials spent on searching the best XGBoost hyperparameters
 
     n_jobs : int, default=-1
         Number of CPU cores used for parallel execution (-1 uses all available).
@@ -393,6 +401,12 @@ def train_eval_model(
     from sklearn.linear_model import ElasticNetCV, LassoCV, RidgeCV, MultiTaskElasticNetCV, MultiTaskLassoCV
     from sklearn.model_selection import KFold
 
+    if model_type == "xgboost":
+        import optuna
+        import optunahub
+        from xgboost import XGBRegressor
+        from sklearn.model_selection import KFold, cross_val_score
+
     def _validate_inputs():
         assert X.shape[0] == len(y), f"\nMismatch between length of X ({X.shape[0]}) and y ({len(y)})\n"
         assert n_targets > 0, "\ny carries no target\n"
@@ -449,7 +463,7 @@ def train_eval_model(
     def _get_targets(idx: np.ndarray) -> np.ndarray:
         return y_arr[idx] if n_targets > 1 else y_arr[idx, 0]
 
-    def _init_pipeline():
+    def _init_pipeline(temp_xgb_params: dict | None = None):
         multi = n_targets > 1
         _kf = KFold(n_splits=5, shuffle=True, random_state=seed_inner)
 
@@ -472,6 +486,15 @@ def train_eval_model(
             "ridge": lambda: RidgeCV(  # natively supports multi-output
                 alphas=alphas, 
                 cv=_kf
+            ), 
+            "xgboost": lambda: XGBRegressor(
+                **xgb_params, 
+                **(temp_xgb_params or best_xgb_params), 
+                max_bin=64, 
+                multi_strategy="multi_output_tree" if multi else "one_output_per_tree", 
+                random_state=seed_inner, 
+                n_jobs=n_jobs, 
+                verbosity=verbose
             )
         }[model_type]()
 
@@ -486,6 +509,50 @@ def train_eval_model(
             steps.insert(0, ("imputer", SimpleImputer(strategy="median")))
 
         return Pipeline(steps=steps)
+
+    def _eval_xgb_params(trial, idx: np.ndarray):
+        space = {
+            "max_depth"       : lambda: trial.suggest_int("max_depth", 1, 9),
+            "learning_rate"   : lambda: trial.suggest_float("learning_rate", 1e-4, 1.0, log=True),
+            "n_estimators"    : lambda: trial.suggest_int("n_estimators", 100, 1000),
+            "min_child_weight": lambda: trial.suggest_int("min_child_weight", 1, 10),
+            "subsample"       : lambda: trial.suggest_float("subsample", 0.1, 1.0),
+            "colsample_bytree": lambda: trial.suggest_float("colsample_bytree", 0.1, 1.0), 
+            # "max_bin"         : lambda: trial.suggest_int("max_bin", 32, 128)
+        }
+        params = { k: fun() for k, fun in space.items() if k not in xgb_params.keys() }
+
+        neg_mae_scores = cross_val_score(
+            estimator=_init_pipeline(temp_xgb_params=params), 
+            X=_get_features(idx), 
+            y=_get_targets(idx), 
+            cv=KFold(n_splits=5, shuffle=True, random_state=seed_inner), 
+            scoring="neg_mean_absolute_error", 
+            n_jobs=n_jobs, 
+            verbose=verbose
+        )
+
+        return -1 * np.mean(neg_mae_scores)
+
+    def _optimize_xgb_params(idx: np.ndarray):
+        try:
+            module = optunahub.load_module(package="samplers/auto_sampler")
+            sampler = module.AutoSampler(seed=seed_inner)
+        except Exception as e:
+            reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+            custom_print(f"\nFalling back on TPESampler, AutoSampler is unavailable: {reason}", level="WARNING")
+            sampler = optuna.samplers.TPESampler(seed=seed_inner)
+
+        optuna.logging.set_verbosity(optuna.logging.INFO if verbose > 0 else optuna.logging.WARNING)
+        custom_print(f"\nSearching the XGBoost hyperparameters over {opt_trials} trial(s) ...")
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+        study.optimize(lambda trial: _eval_xgb_params(trial, idx), n_trials=opt_trials)
+        custom_print("\nParameter optimization is completed :-)")
+        custom_print(f"Cross-validated MAE of the best trial: {study.best_value:.3f}")
+        for k, v in study.best_params.items():
+            custom_print(f"\t{k}: {v}")
+
+        return study.best_params
 
     def _fit_or_load(suffix: str, pipeline, idx: np.ndarray):
         model_path = model_path_template.format(suffix) if model_path_template else None
@@ -576,6 +643,13 @@ def train_eval_model(
     fold_n = np.full(n_samples, -1, dtype=np.int8)
     perfs = []
     best_score = np.inf if perf_metrix == "MAE" else -np.inf
+
+    best_xgb_params = {}
+    if model_type == "xgboost" and bool(model_path_template):
+        suffixes = [ f"fold-{k}" for k in range(n_folds) ] if n_folds > 1 else [ "all" ]
+        model_paths = [ model_path_template.format(s) for s in suffixes ]
+        if not all( _use_cached_model(p) for p in model_paths ):
+            best_xgb_params = _optimize_xgb_params(idx_tr)
 
     if n_folds > 1:
         kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)

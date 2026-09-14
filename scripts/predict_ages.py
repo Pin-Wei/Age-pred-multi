@@ -35,6 +35,15 @@ class Config:
         self.seed = args.seed
         self.seed_inner = args.seed_inner
         self.max_iter = args.max_iter
+        self.xgb_params = {
+            # "max_depth"       : ,
+            # "learning_rate"   : ,
+            # "n_estimators"    : ,
+            # "min_child_weight": ,
+            # "subsample"       : ,
+            # "colsample_bytree":
+        }
+        self.opt_trials = args.opt_trials
         self.n_jobs = args.n_jobs
         self.verbose = args.verbose
         self.overwrite_mdl = args.overwrite_mdl
@@ -180,6 +189,8 @@ def parse_args(
                            help="Number of outer CV folds for the first-level models")
     grp_model.add_argument("--max_iter", type=int, default=10000, 
                            help="Maximum number of iterations for the linear solvers")
+    grp_model.add_argument("--opt_trials", type=int, default=100, 
+                           help="Number of Optuna trials spent on searching the best XGBoost hyperparameters")
     grp_model.add_argument("--seed", type=int, default=42,
                            help="Random seed for the outer cross-validation splits")
     grp_model.add_argument("--seed_inner", type=int, default=0, 
@@ -194,7 +205,7 @@ def parse_args(
                           help="Use the skeletonised TBSS volumes instead of the full ones")
 
     grp_run = parser.add_argument_group("runtime")
-    grp_run.add_argument("--n_jobs", type=int, default=-1, 
+    grp_run.add_argument("--n_jobs", type=int, default=12, 
                          help="Number of CPU cores used for parallel execution; -1 uses all available")
     grp_run.add_argument("--verbose", type=int, default=1, 
                          help="Verbosity level of execution logs")
@@ -281,6 +292,8 @@ def run_lv1_models(subj_df: pd.DataFrame, config: Config) -> tuple[list[pd.DataF
             l1_ratios=config.l1_ratios, 
             alphas=config.alphas, 
             max_iter=config.max_iter, 
+            xgb_params=config.xgb_params, 
+            opt_trials=config.opt_trials, 
             n_jobs=config.n_jobs, 
             verbose=config.verbose, 
             impute_data=False, 
@@ -372,6 +385,8 @@ def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) ->
         l1_ratios=config.l1_ratios,
         alphas=config.alphas,
         max_iter=config.max_iter, 
+        xgb_params=config.xgb_params, 
+        opt_trials=config.opt_trials, 
         n_jobs=config.n_jobs,
         verbose=config.verbose,
         impute_data=True,
