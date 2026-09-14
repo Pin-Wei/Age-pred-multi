@@ -3,48 +3,52 @@
 
 import argparse
 import json
-import os
 from datetime import datetime
-from itertools import product
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from helpers import print_missing, get_tbss_processed, load_feat_table, train_eval_model 
+from helpers import (
+    MODEL_TYPES, L1_RATIOS, ALPHAS, 
+    print_missing, get_tbss_processed, load_feat_table, train_eval_model
+) 
 from utils import to_json_compatible, tee_output
 
 
-MODELS    = ["elasticnet", "ridge"]
-L1_RATIOS = [.1, .5, .7, .9, .95, .99, 1]
-ALPHAS    = [1e-1, 1.0, 3.0, 1e1, 3e1, 1e2, 3e2, 1e3, 1e4, 1e5]
+SID, SET, AGE, COG = "SID", "Set", "Age", "Cog"  # column names
+TARGETS = [AGE, COG]
 
 
 class Config:
-    def __init__(self, args: argparse.Namespace = None):
-        self.args = args if args is not None else parse_args([])
-        self.setup_model_params()
-        self.setup_vars_and_paths()
+    def __init__(self, args: argparse.Namespace | None = None):
+        args = parse_args([]) if args is None else args
+        self.setup_model_params(args)
+        self.setup_vars_and_paths(args)
 
-    def setup_model_params(self):
-        self.model_lv1 = self.args.model_lv1
-        self.model_lv2 = self.args.model_lv2
-        self.l1_ratios = list(self.args.l1_ratios)
-        self.alphas = list(self.args.alphas)
-        self.n_folds = self.args.n_folds
-        self.seed = self.args.seed
-        self.seed_inner = self.args.seed_inner
-        self.max_iter = self.args.max_iter
-        self.n_jobs = self.args.n_jobs
-        self.verbose = self.args.verbose
-        self.overwrite_mdl = self.args.overwrite_mdl
+    def setup_model_params(self, args):
+        self.model_lv1 = args.model_lv1
+        self.model_lv2 = args.model_lv2
+        self.l1_ratios = list(args.l1_ratios)
+        self.alphas = list(args.alphas)
+        self.n_folds = args.n_folds
+        self.seed = args.seed
+        self.seed_inner = args.seed_inner
+        self.max_iter = args.max_iter
+        self.n_jobs = args.n_jobs
+        self.verbose = args.verbose
+        self.overwrite_mdl = args.overwrite_mdl
 
-    def setup_vars_and_paths(self):
+    def setup_vars_and_paths(self, args):
         self.proj_root = Path(__file__).resolve().parents[1]
         self.tbl_dir = self.proj_root / "data" / "tabular"
+        self.cog_score_path = self.tbl_dir / "cog_scores.json"
         self.pyment_tbl_path = self.proj_root / "data" / "pyment" / "predictions" / "predictions.csv"
         
-        lv1_key = f"{self.model_lv1}_cv{self.n_folds}_{self.seed}"
+        lv1_key = f"{len(TARGETS)}y_{self.model_lv1}_cv{self.n_folds}_{self.seed}"
+        if args.add_new_mdls:
+            while (self.proj_root / "models" / lv1_key).is_dir():
+                lv1_key += "+"
         self.lv1_mdl_dir = self.proj_root / "models" / lv1_key
         self.lv1_res_dir = self.proj_root / "results" / lv1_key
         
@@ -56,22 +60,17 @@ class Config:
         self.log_out_path  = self.lv2_res_dir / "logs.txt"
 
         preproc_f_names = self._for_preproc()
-        tbss_key = self._for_tbss()
-        self._for_models(preproc_f_names, tbss_key)
+        tbss_key = self._for_tbss(args)
+        self._for_models(args, preproc_f_names, tbss_key)
 
     def _for_preproc(self):
         self.df_preproc_path = self.tbl_dir / "df_preproc.csv"
         preproc_feats_path = self.proj_root / "data" / "meta" / "preproc_features.txt"
 
-        feats = pd.read_csv(preproc_feats_path, header=None).squeeze().tolist()
+        feats = preproc_feats_path.read_text().splitlines()
         self.sel_feats_by_name = {
             "MRI_ROI": [ f for f in feats if f.startswith("STRUCTURE") and not f.endswith("FA") ]
         }
-        # for approach, domain in product(["MRI", "EEG", "BEH"], ["LANGUAGE", "MEMORY", "MOTOR"]):
-        #     f_name = f"{approach}_{domain}"
-        #     sel_feats = [ f for f in feats if f.startswith(domain) and approach in f ]
-        #     if sel_feats:
-        #         self.sel_feats_by_name.update({f_name: sel_feats})
 
         self.sel_feats_by_name.update({
             "FUN_COGNITIVE": [ 
@@ -83,12 +82,17 @@ class Config:
                 and "BEH" in f
             ]
         })
+        # for approach, domain in product(["MRI", "EEG", "BEH"], ["LANGUAGE", "MEMORY", "MOTOR"]):
+        #     f_name = f"{approach}_{domain}"
+        #     sel_feats = [ f for f in feats if f.startswith(domain) and approach in f ]
+        #     if sel_feats:
+        #         self.sel_feats_by_name.update({f_name: sel_feats})
 
         return list(self.sel_feats_by_name.keys())
 
-    def _for_tbss(self):
-        self.downsmple = self.args.downsample
-        skeleton = int(self.args.skeleton)
+    def _for_tbss(self, args):
+        self.downsmple = args.downsample
+        skeleton = int(args.skeleton)
 
         tbss_dir          = self.proj_root / "data" / "dti" / "tbss"
         self.fa_3d_dir    = tbss_dir / "origdata"
@@ -103,7 +107,7 @@ class Config:
         
         return key
 
-    def _for_models(self, preproc_f_names, tbss_key):
+    def _for_models(self, args, preproc_f_names, tbss_key):
         feat_name_2_affix = {
             "DTI_FA"    : f"dti_fa{tbss_key}", 
             "DTI_MD"    : f"dti_md{tbss_key}", 
@@ -118,10 +122,10 @@ class Config:
             if f_name != "MRI_ROI"
         })
         self.feat_types  = list(feat_name_2_affix.keys())
-        if self.args.feat_types:  # the paths below stay complete; only the first level's loop shrinks
-            unknown = [ f for f in self.args.feat_types if f not in feat_name_2_affix ]
-            assert not unknown, f"\nUnknown --feat-types {unknown}; available: {self.feat_types}\n"
-            self.feat_types = [ f for f in self.feat_types if f in set(self.args.feat_types) ]
+        if args.feat_types:  # the paths below stay complete; only the first level's loop shrinks
+            unknown = [ f for f in args.feat_types if f not in feat_name_2_affix ]
+            assert not unknown, f"\nUnknown --feat_types {unknown}; available: {self.feat_types}\n"
+            self.feat_types = [ f for f in self.feat_types if f in set(args.feat_types) ]
 
         self.tbl_paths   = {}
         self.model_paths = {}
@@ -141,6 +145,7 @@ class Config:
         self.lv2_model_path = self.lv2_mdl_dir / f"pipeline_{{}}.joblib"
         self.lv2_perf_path  = self.lv2_res_dir / f"performance.csv"
         self.lv2_calib_path = self.lv2_res_dir / f"age-correction_params.csv"
+
 
 def parse_args(
     argv: list[str] = None, 
@@ -163,48 +168,73 @@ def parse_args(
     )
 
     grp_model = parser.add_argument_group("model")
-    grp_model.add_argument("--model-lv1", choices=MODELS, default=MODELS[0],
-                           help="model fitted per feature type; also names the first-level dirs")
-    grp_model.add_argument("--model-lv2", choices=MODELS, default=MODELS[1],
-                           help="model fitted on the first-level predicted ages")
-    grp_model.add_argument("--l1-ratios", nargs="+", type=float, default=L1_RATIOS, metavar="R",
-                           help="elasticnet mixing parameters to search over")
+    grp_model.add_argument("--model_lv1", choices=MODEL_TYPES, default=MODEL_TYPES[0],
+                           help="Type of regression algorithm to use for first-level models")
+    grp_model.add_argument("--model_lv2", choices=MODEL_TYPES, default=MODEL_TYPES[2],
+                           help="Type of regression algorithm to use for the second-level model")
+    grp_model.add_argument("--l1_ratios", nargs="+", type=float, default=L1_RATIOS, metavar="R",
+                           help="L1 penalty mixing parameter grid for ElasticNet models")
     grp_model.add_argument("--alphas", nargs="+", type=float, default=ALPHAS, metavar="A",
-                           help="regularization strengths to search over")
-    grp_model.add_argument("--n-folds", type=int, default=5,
-                           help="outer CV folds of the first level; also names the first-level dirs")
-    grp_model.add_argument("--max-iter", type=int, default=10000, help="solver iteration cap")
+                           help="Regularization strength grid for linear models")
+    grp_model.add_argument("--n_folds", type=int, default=5,
+                           help="Number of outer CV folds for the first-level models")
+    grp_model.add_argument("--max_iter", type=int, default=10000, 
+                           help="Maximum number of iterations for the linear solvers")
     grp_model.add_argument("--seed", type=int, default=42,
-                           help="outer split seed; also names the first- and second-level dirs")
-    grp_model.add_argument("--seed-inner", type=int, default=0, help="inner CV split seed")
+                           help="Random seed for the outer cross-validation splits")
+    grp_model.add_argument("--seed_inner", type=int, default=0, 
+                           help="Random seed for hyperparameter tuning")
 
     grp_data = parser.add_argument_group("data")
-    grp_data.add_argument("--feat-types", nargs="+", default=None, metavar="FEAT",
-                          help="restrict the first level to these feature types; None runs all of them")
+    grp_data.add_argument("--feat_types", nargs="+", default=None, metavar="FEAT",
+                          help="Run first-level models only for specified feature types")
     grp_data.add_argument("--downsample", type=int, default=2,
-                          help="voxel stride for the TBSS volumes; also names their cached .npy files")
+                          help="Voxel stride for the TBSS volumes")
     grp_data.add_argument("--skeleton", action="store_true",
-                          help="use the skeletonised TBSS volumes instead of the full ones")
+                          help="Use the skeletonised TBSS volumes instead of the full ones")
 
     grp_run = parser.add_argument_group("runtime")
-    grp_run.add_argument("--n-jobs", type=int, default=-1, help="parallel jobs per fit")
-    grp_run.add_argument("--verbose", type=int, default=1, help="verbosity of the fits")
-    grp_run.add_argument("--overwrite-mdl", action="store_true",
-                         help="refit and overwrite the models already saved on disk")
+    grp_run.add_argument("--n_jobs", type=int, default=-1, 
+                         help="Number of CPU cores used for parallel execution; -1 uses all available")
+    grp_run.add_argument("--verbose", type=int, default=1, 
+                         help="Verbosity level of execution logs")
+    grp_run.add_argument("--overwrite_mdl", action="store_true",
+                         help="Refit and overwrite the models already saved on disk")
+    grp_run.add_argument("--add_new_mdls", action="store_true", 
+                         help="Create a new folder and retrain the models without overwriting the existing ones.")
 
     parser.set_defaults(**(defaults or {}))  # after the options exist, so that --help shows the replacements
 
     return parser.parse_args(argv)
 
 
-def load_data(f_name: str, config: Config) -> tuple[np.ndarray, np.ndarray | pd.DataFrame]:
+def load_targets(config: Config) -> pd.DataFrame:
+    subj_df = pd.read_csv(
+        config.df_preproc_path, index_col="BASIC_INFO_ID", 
+        usecols=["BASIC_INFO_ID", "BASIC_INFO_AGE", SET]
+    )
+    subj_df.index.name = SID
+    subj_df = subj_df.rename(columns={"BASIC_INFO_AGE": AGE})
+
+    if COG in TARGETS:
+        assert config.cog_score_path.is_file(), f"\n'{config.cog_score_path.name}' not exists; run make_df_scores.py first\n"
+        cog_data = json.loads(config.cog_score_path.read_text())
+        cog_scores = pd.Series(cog_data["scores"])
+
+        print_missing(subj_df.index.to_list(), cog_scores.index.to_list())
+        subj_df[COG] = cog_scores
+
+    return subj_df.loc[:, [SET] + TARGETS]
+
+
+def load_data(f_name: str, config: Config) -> tuple[list[str], np.ndarray | pd.DataFrame]:
     if f_name in ["DTI_FA", "DTI_MD"]:
-        X_subjs = [ fp.name.split(".")[0] for fp in sorted(config.fa_3d_paths) ]  # the order TBSS merge per-subject FA volumes
+        subj_list = [ fp.name.split(".")[0] for fp in sorted(config.fa_3d_paths) ]  # the order TBSS merge per-subject FA volumes
 
     if f_name == "DTI_FA":
         X = get_tbss_processed(
             img_path=config.fa_4d_path, 
-            N=len(X_subjs), 
+            N=len(subj_list), 
             stride=config.downsmple, 
             mask_path=config.fa_mask_path, 
             cache=config.fa_npy_path
@@ -212,18 +242,18 @@ def load_data(f_name: str, config: Config) -> tuple[np.ndarray, np.ndarray | pd.
     elif f_name == "DTI_MD":
         X = get_tbss_processed(
             img_path=config.md_4d_path, 
-            N=len(X_subjs), 
+            N=len(subj_list), 
             stride=config.downsmple, 
             mask_path=config.fa_mask_path, 
             cache=config.md_npy_path
         )
     elif f_name in config.sel_feats_by_name.keys():
         sel_feats = config.sel_feats_by_name[f_name]
-        X_subjs, X = load_feat_table(config.tbl_paths[f_name], usecols=["BASIC_INFO_ID"]+sel_feats)
+        subj_list, X = load_feat_table(config.tbl_paths[f_name], usecols=["BASIC_INFO_ID"]+sel_feats)
     else:
-        X_subjs, X = load_feat_table(config.tbl_paths[f_name])
+        subj_list, X = load_feat_table(config.tbl_paths[f_name])
     
-    return X_subjs, X
+    return subj_list, X
 
 
 def run_lv1_models(subj_df: pd.DataFrame, config: Config) -> tuple[list[pd.DataFrame], dict]:
@@ -233,17 +263,17 @@ def run_lv1_models(subj_df: pd.DataFrame, config: Config) -> tuple[list[pd.DataF
 
     for f_name in config.feat_types:
         print(f"\nLoading {f_name} data ...")
-        X_subjs, X = load_data(f_name, config)
-        missing = print_missing(subj_df.index.tolist(), X_subjs)
+        subj_list, X = load_data(f_name, config)
+        missing = print_missing(subj_df.index.to_list(), subj_list)
 
-        ages = subj_df["BASIC_INFO_AGE"].loc[X_subjs].to_numpy(dtype=np.float32)
-        sets = subj_df["Set"].loc[X_subjs].to_numpy(dtype=str)
+        y = subj_df.loc[subj_list, TARGETS].astype(np.float32)
+        sets = subj_df.loc[subj_list, SET].to_numpy(dtype=str)
         idx_tr = np.where(sets == "train")[0]
         idx_te = np.where(sets == "test")[0]
 
         print(f"\nTrain and eval {config.model_lv1} models on {f_name} features ...")
         y_pred, _, fold_n = train_eval_model(  # no age-bias correction on this level
-            X, ages, idx_tr, idx_te, 
+            X, y, idx_tr, idx_te, 
             model_type=config.model_lv1, 
             seed=config.seed, 
             seed_inner=config.seed_inner, 
@@ -259,11 +289,10 @@ def run_lv1_models(subj_df: pd.DataFrame, config: Config) -> tuple[list[pd.DataF
             overwrite=config.overwrite_mdl
         )
         pred_by_feat.append(
-            pd.DataFrame({
-                "SID": X_subjs,
-                f"Fold_{f_name}": fold_n,
-                f"Age_{f_name}": y_pred,
-            })
+            pd.concat([
+                pd.DataFrame({SID: subj_list, f"Fold_{f_name}": fold_n}), 
+                y_pred.add_suffix(f"_{f_name}")
+            ], axis=1)
         )
         summ_by_feat[f_name] = {
             "source"       : str(src_paths[f_name]),
@@ -281,16 +310,10 @@ def run_lv1_models(subj_df: pd.DataFrame, config: Config) -> tuple[list[pd.DataF
 
 
 def merge_preds(subj_df: pd.DataFrame, pred_by_feat: list[pd.DataFrame]) -> pd.DataFrame:
-    pred_out = (
-        subj_df
-        .reset_index()
-        .rename(columns={
-            subj_df.index.name: "SID",
-            "BASIC_INFO_AGE": "Age"
-        })
-    )
+    pred_out = subj_df.reset_index()
+
     for df in pred_by_feat:
-        pred_out = pd.merge(pred_out, df, on="SID", how="left")
+        pred_out = pd.merge(pred_out, df, on=SID, how="left")
 
     return pred_out
 
@@ -300,17 +323,17 @@ def add_pyment_results(pred_out: pd.DataFrame, summ_by_feat: dict, config: Confi
     config.feat_types.append(f_name)
 
     pyment_df = pd.read_csv(config.pyment_tbl_path, usecols=["subject", "age"])
-    pyment_df.insert(0, "SID", pyment_df["subject"].map(lambda x: f"sub-{x:04d}").values)
-    data_subjs = pyment_df["SID"].values
+    pyment_df.insert(0, SID, pyment_df["subject"].map(lambda x: f"sub-{x:04d}").values)
+    data_subjs = pyment_df[SID].values
     pyment_df.drop(columns=["subject"], inplace=True)
-    pyment_df.rename(columns={"age": f"Age_{f_name}"}, inplace=True)
+    pyment_df.rename(columns={"age": f"{AGE}_{f_name}"}, inplace=True)
     pyment_df[f"Fold_{f_name}"] = -1  # used publicly available pre-trained model
-    pred_out = pd.merge(pred_out, pyment_df, on="SID", how="left")    
-    missing = print_missing(pred_out["SID"].values, data_subjs)
+    pred_out = pd.merge(pred_out, pyment_df, on=SID, how="left")    
+    missing = print_missing(pred_out[SID].values, data_subjs)
 
-    temp_df = pd.merge(pyment_df, pred_out.loc[:, ["SID", "Age"]], on="SID", how="left")
-    y = temp_df["Age"].values
-    y_pred = temp_df[f"Age_{f_name}"].values
+    temp_df = pd.merge(pyment_df, pred_out.loc[:, [SID, AGE]], on=SID, how="left")
+    y = temp_df[AGE].values
+    y_pred = temp_df[f"{AGE}_{f_name}"].values
     err = y - y_pred
     mae = np.mean(np.abs(err))
     r2 = 1 - np.sum(err ** 2) / np.sum((y - y.mean()) ** 2)
@@ -320,22 +343,26 @@ def add_pyment_results(pred_out: pd.DataFrame, summ_by_feat: dict, config: Confi
         "n_subjs"      : len(data_subjs), 
         "n_missing"    : len(missing), 
         "missing_subjs": missing,
-        "performance"  : {"Split": "All", "MAE": mae, "R2": r2}
+        "performance"  : {"Split": "All", f"MAE_{AGE}": mae, f"R2_{AGE}": r2}
     }
 
     return pred_out, summ_by_feat
 
 
 def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) -> tuple[pd.DataFrame, dict]:
-    lv1_age_cols = [ f"Age_{f_name}" for f_name in config.feat_types ]
-    sets = pred_out["Set"].to_numpy(dtype=str)
+    lv1_pred_cols = [ 
+        f"{target}_{f_name}" 
+        for f_name in config.feat_types for target in TARGETS 
+        if f"{target}_{f_name}" in pred_out.columns
+    ]
+    sets = pred_out[SET].to_numpy(dtype=str)
     idx_tr = np.where(sets == "train")[0]
     idx_te = np.where(sets == "test")[0]
 
-    print(f"\nTrain and eval the final {config.model_lv2} model on the {len(lv1_age_cols)} predicted ages ...")
+    print(f"\nTrain and eval the final {config.model_lv2} model on the {len(lv1_pred_cols)} first-level prediction(s) ...")
     y_pred, y_pred_ac, _ = train_eval_model(
-        X=pred_out[lv1_age_cols].astype(np.float32), 
-        y=pred_out["Age"].to_numpy(dtype=np.float32),
+        X=pred_out.loc[:, lv1_pred_cols].astype(np.float32), 
+        y=pred_out.loc[:, TARGETS].astype(np.float32),
         idx_tr=idx_tr,
         idx_te=idx_te,
         model_type=config.model_lv2,
@@ -344,7 +371,7 @@ def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) ->
         n_folds=config.n_folds, 
         l1_ratios=config.l1_ratios,
         alphas=config.alphas,
-        max_iter=config.max_iter,
+        max_iter=config.max_iter, 
         n_jobs=config.n_jobs,
         verbose=config.verbose,
         impute_data=True,
@@ -354,8 +381,11 @@ def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) ->
         calib_param_path=config.lv2_calib_path, 
         overwrite=config.overwrite_mdl
     )
-    pred_out["Age_Final"] = y_pred
-    pred_out["C-Age_Final"] = y_pred_ac
+    pred_out = pd.concat([
+        pred_out, 
+        y_pred.add_suffix("_Final"), 
+        y_pred_ac.add_suffix("_Final").add_prefix("C-")
+    ], axis=1)
 
     summ_out = {
         "model_lv1"  : config.model_lv1,
@@ -373,7 +403,7 @@ def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) ->
         "feat_types" : summ_by_feat,
         "final"      : {
             "model_paths": str(config.lv2_model_path),
-            "features"   : lv1_age_cols,
+            "features"   : lv1_pred_cols,
             "performance": pd.read_csv(config.lv2_perf_path, index_col="Split").to_dict(orient="index")
         }
     }
@@ -382,9 +412,8 @@ def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) ->
 
 
 def main(config: Config):
-    subj_df = pd.read_csv(config.df_preproc_path, index_col="BASIC_INFO_ID", usecols=["BASIC_INFO_ID", "BASIC_INFO_AGE", "Set"])
-    n_subjs = len(subj_df)
-    print(f"\nNumber of participants: {n_subjs}")
+    subj_df = load_targets(config)
+    print(f"\nNumber of participants: {len(subj_df)}")
 
     pred_by_feat, summ_by_feat = run_lv1_models(subj_df, config)
     pred_out = merge_preds(subj_df, pred_by_feat)

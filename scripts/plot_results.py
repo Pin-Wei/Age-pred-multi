@@ -2,17 +2,15 @@
 
 
 import argparse
-import os
-import re
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
+from predict_ages import SET, AGE, TARGETS
 import calc_corr
-from summ_results import load_preds
+from summ_results import TARG_COL, FEAT_COL, load_preds
 from plotting import (
-    Style, model_name_2_label, 
+    BASE_FS, Style, model_name_2_label, 
     plot_age_scatter, plot_coef_bars, plot_mae_bars, plot_corr_boxes, plot_corr_heat
 )
 
@@ -47,6 +45,7 @@ class Config(calc_corr.Config):
         lv2_res_dir = self.eval_dir.parent
         lv2_mdl_name = lv2_res_dir.name
         lv1_mdl_name = lv2_res_dir.parent.name
+        # self.lv2_mdl = lv2_mdl_name.split("_")[0]
 
         fig_out_dir_1 = self.proj_root / "figures" / lv1_mdl_name / lv2_mdl_name
         fig_out_dir_2 = fig_out_dir_1 / eval_name / corr_name
@@ -58,7 +57,7 @@ class Config(calc_corr.Config):
         self.corr_agg_m_path = self.agg_m_out_path  # aggregated correlation statistics over seeds per model
 
         self.age_scatter_templ = fig_out_dir_1 / "[scatter] Fits between real and predicted ages ({}).png"
-        self.coef_bars_templ   = fig_out_dir_1 / "[bars] Coefficients of the fold-{} 2nd-level model.png"
+        self.coef_bars_templ   = fig_out_dir_1 / "[bars] Coefficients of the fold-{} 2nd-level model ({}).png"
         self.mae_bars_path     = fig_out_dir_2 / f"[bars] MAE of 2nd-level models ({self.data_set}).png"
         self.corr_boxes_path   = fig_out_dir_2 / f"[boxes] Correlations between PAD{self.pad_type} and {self.score_name} scores ({self.data_set}).png"
         self.corr_heat_path    = fig_out_dir_2 / f"[heat] Correlations between PAD{self.pad_type} and {self.score_name} scores ({self.data_set}).png"
@@ -75,13 +74,26 @@ def parse_args(argv: list[str] = None) -> argparse.Namespace:
 
     grp_fig = parser.add_argument_group("figure")
     grp_fig.add_argument("--fig_scale", type=float, default=1.,
-                         help="multiplies the canvas and every element size")
+                         help="Scaling multiplier for the canvas and all its elements")
     grp_fig.add_argument("--font_scale", type=float, default=1.,
-                         help="multiplies every text size (14 pt base)")
+                         help=f"Scaling multiplier for all text sizes ({BASE_FS} pt base)")
     grp_fig.add_argument("--dpi", type=int, default=200,
-                         help="resolution the figures are saved at")
+                         help="Resolution the figures are saved at")
 
     return calc_corr.parse_args(argv, parser=parser)
+
+
+def feat_to_block(feat: str) -> str:
+    '''
+    Name of the first-level block a second-level feature came from
+    (i.e. the column name with its target prefix removed)
+    (e.g., "Age_MRI_ROI" -> "MRI_ROI")
+    '''
+    target, _, block = feat.partition("_")
+    if (target in TARGETS) and (block != ""):
+        return block
+    else:
+        return feat
 
 
 def main(config: Config):
@@ -90,10 +102,10 @@ def main(config: Config):
 
         preds_df, preds_cols = load_preds(config.preds_path)
         if config.data_set != "all":
-            preds_df = preds_df.query(f"Set == '{config.data_set}'")
+            preds_df = preds_df.query(f"{SET} == '{config.data_set}'")
 
-        # age_lo = min(preds_df["Age"].min(), preds_df.loc[:, preds_cols].min().min())
-        # age_hi = max(preds_df["Age"].max(), preds_df.loc[:, preds_cols].max().max())
+        # age_lo = min(preds_df[AGE].min(), preds_df.loc[:, preds_cols].min().min())
+        # age_hi = max(preds_df[AGE].max(), preds_df.loc[:, preds_cols].max().max())
         # pad = (age_lo, age_hi) *.04
         # age_lims = (age_lo - pad, age_hi + pad)
         age_lims = (0, 100)
@@ -103,12 +115,12 @@ def main(config: Config):
         fits_df.set_index("Model", inplace=True)  # should be unique
 
         for preds_col in preds_cols:
-            model = preds_col.replace("Age_", "")
+            model = preds_col.replace(f"{AGE}_", "")
             plot_age_scatter(
-                real_ages=preds_df["Age"].to_numpy(dtype=float),
+                real_ages=preds_df[AGE].to_numpy(dtype=float),
                 pred_ages=preds_df[preds_col].to_numpy(dtype=float), 
                 age_lims=age_lims, 
-                subj_sets=preds_df["Set"].to_list(), 
+                subj_sets=preds_df[SET].to_list(), 
                 subj_set_label=config.data_set, 
                 N=fits_df.at[model, "N"], 
                 slope=fits_df.at[model, "slope_pred"], 
@@ -120,14 +132,25 @@ def main(config: Config):
 
     if "coef_bars" in config.to_draw:
         assert config.coefs_path.is_file(), f"'{config.coefs_path}' not exists. You should run `summ_results.py` first."
-        coefs_df = pd.read_csv(config.coefs_path, index_col=0)
+        coefs_df = pd.read_csv(config.coefs_path, index_col=[TARG_COL, FEAT_COL])
+        targs = coefs_df.index.get_level_values(TARG_COL).unique()
+        feats = coefs_df.index.get_level_values(FEAT_COL).unique()
 
         for fold_n in coefs_df.columns:
-            plot_coef_bars(
-                dat=coefs_df[f"{fold_n}"].sort_values(), 
-                out_path=Path(str(config.coef_bars_templ).format(fold_n)), 
-                style=config.style
-            )
+            weights = coefs_df[fold_n].unstack(TARG_COL).reindex(index=feats, columns=targs)
+            weights = weights.groupby(feats.map(feat_to_block), sort=False).sum()
+            # weights = weights.abs().groupby(feats.map(feat_to_block), sort=False).sum()
+
+            if len(targs) > 1:
+                weights["mean"] = weights.mean(axis=1)
+                # weights["mean"] = weights.abs().mean(axis=1)
+
+            for col in weights.columns:
+                plot_coef_bars(
+                    dat=weights[col].sort_values(), 
+                    out_path=Path(str(config.coef_bars_templ).format(fold_n, col)), 
+                    style=config.style
+                )
 
     if any([ x in config.to_draw for x in ["mae_bars", "corr_boxes", "corr_heat"] ]):
         assert config.corr_agg_m_path.is_file(), f"'{config.corr_agg_m_path}' not exists. You should run `calc_corr.py` first."

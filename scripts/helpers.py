@@ -4,12 +4,17 @@
 import os
 import json
 from pathlib import Path
-from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 
 from utils import custom_print
+
+
+MODEL_TYPES = ["elasticnet", "lasso", "ridge"]
+L1_RATIOS = [.1, .5, .7, .9, .95, .99, 1]
+ALPHAS = [1e-1, 1.0, 3.0, 1e1, 3e1, 1e2, 3e2, 1e3, 1e4, 1e5]
 
 
 def print_missing(all_subjs: list[str], data_subjs: list[str]) -> list[str]:
@@ -249,98 +254,150 @@ def load_feat_table(
 
 def train_eval_model(
     X: np.ndarray | pd.DataFrame,
-    y: np.ndarray,
+    y: np.ndarray | pd.DataFrame,
     idx_tr: np.ndarray, 
     idx_te: np.ndarray, 
     model_type: str, 
     seed: int = 42, 
     seed_inner: int = 0, 
     n_folds: int = 5, 
-    l1_ratios: list[float] = [.1, .5, .7, .9, .95, .99, 1], 
-    alphas: list[float] = [1e-1, 1.0, 3.0, 1e1, 3e1, 1e2, 3e2, 1e3, 1e4, 1e5], 
+    l1_ratios: list[float] = L1_RATIOS, 
+    alphas: list[float] = ALPHAS, 
     max_iter: int = 10000, 
     n_jobs: int = -1, 
     verbose: int = 1, 
     impute_data: bool = False,
     perf_metrix: str = "MAE",
     apply_correction: bool = False,
-    model_path_template: str | Path = None,
-    model_perf_path: str | Path = None,
-    calib_param_path: str | Path = None,
+    model_path_template: str | Path | None = None,
+    model_perf_path: str | Path | None = None,
+    calib_param_path: str | Path | None = None,
     overwrite: bool = False
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+) -> tuple[pd.DataFrame, pd.DataFrame | None, np.ndarray]:
     '''
-    Fit one or many [scaler -> CV regressor] pipeline(s) and return training and testing
-    predictions, their age-corrected counterpart, and fold indices.
+    Fit one or more [optional imputer -> scaler -> regressor] pipeline(s) to 
+    produce train/test predictions, their age-corrected counterparts (optional), 
+    plus the indices of folds to which they belong.
 
-    Fold indices are `n_folds`- 1 at which each training sample was held out; 
-    -1 for testing and unused samples. 0 for training samples if n_folds <= 1.
+    Fitted models, their performance metrics, and age-correction parameters 
+    can optionally be cached to disk.
 
-    Pipeline(s) begin with an imputer if `impute_data` is set to True.
+    If multiple targets are present in `y`, 
+    they are scaled to a common range (see `TargetScaler`) and fit jointly.
 
-    The type of CV regressor is set by `model_type`, 
-    which can be "elasticnet", "lasso", or "ridge".
-    (CV is for regularization strength, always 5 folds, seeded by `seed_inner`).
+    Parameters
+    ----------
+    X : np.ndarray or pd.DataFrame of shape (n_samples, n_features)
+        Input feature matrix.
 
-    For training set (data rows indexed by `idx_tr`), if `n_folds` > 1, 
-    predictions are generated over `n_folds` folds (seeded by `seed`)
-    from models trained on out-of-fold data; 
-    otherwise, predictions are generated from the model trained on itself.
-    
-    For testing set (data rows indexed by `idx_te`),
-    predictions are generated from the model trained on best fold,
-    which is determined by `perf_metrix` ("MAE" or "R2").
+    y : np.ndarray or pd.DataFrame of shape (n_samples,) or (n_samples, n_targets)
+        Target vector or table.
 
-    If `model_path_template` is given, 
-    fitted pipelines are cached to disk (parent directory is created if needed),
-    or an existing file is loaded (unless `overwrite` is set to True).
-    If omitted, models are neither loaded nor saved.
-    It must contain a single "{}" placeholder (will be filled with "fold-*" or "all")
-    and end with ".joblib".
+    idx_tr : np.ndarray of shape (n_train,)
+        Integer row indices of `X`/`y` assigned to the training/cross-validation set.
 
-    If `model_perf_path` is given, 
-    a CSV file will be created to write performance metrics in long format,
-    with columns `Split`, `N`, `MAE`, `R2` and one row per split:
-    - "Val_fold-{0 ... n-1}": each outer fold's held-out samples
-    - "Val_mean" / "Val_SD" : mean and sample SD (ddof=1) across those folds
-    - "Val_pooled"          : all out-of-fold predictions on `idx_tr` scored at once
-    - "Test"                : predictions on `idx_te`
-    In the `n_folds <= 1` mode, the rows are instead "Train" and "Test".
-    Always (re)written when given, regardless of `overwrite`.
-    If omitted, metrics are neither computed nor saved.
+    idx_te : np.ndarray of shape (n_test,)
+        Integer row indices of `X`/`y` assigned to the external test set.
 
-    If `apply_correction` is set to True, 
-    the second returned array holds the age-corrected predictions 
-    generated through a per-fold calibration (see `_fit_calibrator`); 
-    it is `None` otherwise. 
+    model_type : str
+        Type of regression algorithm to use. Must be one of `MODEL_TYPES` 
+        (e.g., "elasticnet", "lasso", "ridge").
 
-    If `calib_param_path` is given when `apply_correction` is True,
-    a CSV file will be created to record the fitted parameters, one row per fold.
-    Always (re)written when given, regardless of `overwrite`.
-    If omitted, the parameters are applied but not saved.
+    seed : int, default=42
+        Random seed for the outer cross-validation splits on `idx_tr`.
+
+    seed_inner : int, default=0
+        Random seed for the inner cross-validation (hyperparameter tuning).
+
+    n_folds : int, default=5
+        Number of outer CV folds. If `n_folds <= 1`, the entire training set is 
+        used to fit a single model without out-of-fold validation.
+
+    l1_ratios : list of float, default=[0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
+        L1 penalty mixing parameter grid for ElasticNet models.
+
+    alphas : list of float, default=[1e-1, ..., 1e5]
+        Regularization strength grid for linear models.
+
+    max_iter : int, default=10000
+        Maximum number of iterations for the linear solvers.
+
+    n_jobs : int, default=-1
+        Number of CPU cores used for parallel execution (-1 uses all available).
+
+    verbose : int, default=1
+        Verbosity level of execution logs.
+
+    impute_data : bool, default=False
+        If True, prepends an imputation step at the beginning of the pipeline.
+
+    perf_metrix : {"MAE", "R2"}, default="MAE"
+        Metric used to select the "best" outer fold model for evaluating `idx_te`.
+        Averaged across targets if multi-target.
+
+    apply_correction : bool, default=False
+        If True, fits an age-bias calibration per-fold/per-target and returns 
+        bias-corrected predictions. Requires `n_folds > 1`.
+
+    model_path_template : str or Path, optional
+        File path pattern to save/load fitted pipelines. Must contain a single `"{}"` 
+        placeholder (formatted as `"fold-{i}"` or `"all"`) and end with `".joblib"`.
+        If cached models exist and match target names, they are loaded unless 
+        `overwrite=True`.
+
+    model_perf_path : str or Path, optional
+        Path to save model evaluation metrics as a long-format CSV. If omitted,
+        metrics are not written to disk.
+
+    calib_param_path : str or Path, optional
+        Path to save age-calibration parameters (`const_*`, `slope_*`) as a CSV.
+        Only used if `apply_correction=True`.
+
+    overwrite : bool, default=False
+        If True, re-trains and overwrites cached model files at `model_path_template`.
+        (Metric and calibration CSVs are always overwritten regardless).
+
+    Returns
+    -------
+    y_pred : pd.DataFrame
+        Raw predictions. For `idx_tr`, predictions are out-of-fold (if `n_folds > 1`)
+        or in-sample (if `n_folds <= 1`). For `idx_te`, predictions are generated 
+        by the best-performing fold model.
+        
+    y_pred_ac : pd.DataFrame | None
+        Age-corrected predictions if `apply_correction=True`, otherwise `None`.
+
+    fold_n : np.ndarray
+        Outer fold index for each sample:
+        - `n_folds - 1`: Outer validation fold index for training rows.
+        - `0`: For all training rows if `n_folds <= 1`.
+        - `-1`: For testing rows (`idx_te`) and unselected samples.
 
     Raises
     ------
     AssertionError
-    - `X` / `y` lengths mismatch
-    - `y` is not 1-D
-    - `idx_tr` / `idx_te` are not integer indices, are empty, are out of bounds, or overlap
-    - `model_type` or `perf_metrix` is unknown
-    - `apply_correction` is asked for with `n_folds` <= 1
-    - `calib_param_path` is given without `apply_correction`
-    - the output paths violate the format constraints above
+    - Dimensions of `X` and `y` do not match.
+    - `y` carries no target, a non-numeric one, or NaN.
+    - `idx_tr` / `idx_te` are not integer indices, are empty, are out of bounds, or overlap.
+    - `model_type` or `perf_metrix` is invalid.
+    - `apply_correction=True` when `n_folds <= 1`.
+    - `calib_param_path` is specified but `apply_correction=False`.
+    - `model_path_template` violates filename conventions.
     '''
 
     import joblib
     from sklearn.pipeline import Pipeline
     from sklearn.impute import SimpleImputer
     from sklearn.preprocessing import StandardScaler
-    from sklearn.linear_model import ElasticNetCV, LassoCV, RidgeCV
+    from sklearn.compose import TransformedTargetRegressor
+    from sklearn.linear_model import ElasticNetCV, LassoCV, RidgeCV, MultiTaskElasticNetCV, MultiTaskLassoCV
     from sklearn.model_selection import KFold
 
     def _validate_inputs():
         assert X.shape[0] == len(y), f"\nMismatch between length of X ({X.shape[0]}) and y ({len(y)})\n"
-        assert y.ndim == 1, f"\ny must be 1-D, got shape {y.shape}\n"
+        assert n_targets > 0, "\ny carries no target\n"
+        assert Y.dtypes.map(pd.api.types.is_numeric_dtype).all(), "\ny carries non-numeric target(s)\n"
+        assert not Y.isna().any(axis=None), "\ny carries NaN target(s)\n"
         assert idx_tr.dtype.kind in "iu" and idx_te.dtype.kind in "iu", f"\nidx_tr/idx_te must be integer indices, got {idx_tr.dtype}/{idx_te.dtype}\n"
 
         overlap = np.intersect1d(idx_tr, idx_te)
@@ -350,7 +407,7 @@ def train_eval_model(
             assert idx.size > 0, f"\n{nm} is empty\n"
             assert idx.min() >= 0 and idx.max() < len(y), f"\n{nm} out of bounds: [{idx.min()}, {idx.max()}] vs len(y)={len(y)}\n"
         
-        assert model_type in {"elasticnet", "lasso", "ridge"}, f"\nModel type '{model_type}' is undefined.\n"
+        assert model_type in MODEL_TYPES, f"\nModel type '{model_type}' is undefined.\n"
         assert perf_metrix in {"MAE", "R2"}, f"\nPerformance metrix '{perf_metrix}' is undefined.\n"
 
         assert not (apply_correction and n_folds <= 1), (
@@ -380,12 +437,24 @@ def train_eval_model(
             assert calib_param_path.endswith(".csv"), f"\n'calib_param_path' should end with .csv, got:\n{calib_param_path}"
             _dir_3 = os.path.dirname(calib_param_path)
             if _dir_3:
-                os.makedirs(_dir_3, exist_ok=True)
+                os.makedirs(_dir_3, exist_ok=True)        
 
-    def _init_model():
+    def _use_cached_model(model_path: str) -> bool:
+        return bool(model_path_template) and os.path.isfile(model_path) and not overwrite
+
+    def _get_features(idx: np.ndarray) -> np.ndarray | pd.DataFrame:
+        # The parameter X is read directly from the local variable
+        return X.iloc[idx] if isinstance(X, pd.DataFrame) else X[idx]
+
+    def _get_targets(idx: np.ndarray) -> np.ndarray:
+        return y_arr[idx] if n_targets > 1 else y_arr[idx, 0]
+
+    def _init_pipeline():
+        multi = n_targets > 1
         _kf = KFold(n_splits=5, shuffle=True, random_state=seed_inner)
-        model_name_2_obj = {
-            "elasticnet": ElasticNetCV(
+
+        regressor = {
+            "elasticnet": lambda: (MultiTaskElasticNetCV if multi else ElasticNetCV)(
                 l1_ratio=l1_ratios, 
                 alphas=alphas, 
                 cv=_kf, 
@@ -393,70 +462,99 @@ def train_eval_model(
                 n_jobs=n_jobs, 
                 verbose=verbose
             ), 
-            "lasso": LassoCV(
+            "lasso": lambda: (MultiTaskLassoCV if multi else LassoCV)(
                 alphas=alphas, 
                 cv=_kf, 
                 max_iter=max_iter, 
                 n_jobs=n_jobs, 
                 verbose=verbose
             ), 
-            "ridge": RidgeCV(
+            "ridge": lambda: RidgeCV(  # natively supports multi-output
                 alphas=alphas, 
                 cv=_kf
             )
-        }
+        }[model_type]()
 
-        if model_type not in model_name_2_obj.keys():
-            raise ValueError(f"Unknown model_type: {model_type}")
+        if multi:
+            regressor = TransformedTargetRegressor(
+                regressor=regressor, transformer=TargetScaler()
+            )
+
+        steps = [("scaler", StandardScaler()), ("model", regressor)]
 
         if impute_data:
-            return Pipeline(steps=[
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                ("model", model_name_2_obj[model_type])
-            ])
-        else:
-            return Pipeline(steps=[
-                ("scaler", StandardScaler()),
-                ("model", model_name_2_obj[model_type])
-            ])
+            steps.insert(0, ("imputer", SimpleImputer(strategy="median")))
 
-    def _get_rows(idx: np.ndarray) -> np.ndarray | pd.DataFrame:
-        # The parameter X is read directly from the local variable
-        return X.iloc[idx] if isinstance(X, pd.DataFrame) else X[idx]
+        return Pipeline(steps=steps)
 
-    def _fit_or_load(suffix: str, model, X_fit: np.ndarray | pd.DataFrame, y_fit: np.ndarray):
+    def _fit_or_load(suffix: str, pipeline, idx: np.ndarray):
         model_path = model_path_template.format(suffix) if model_path_template else None
 
-        if model_path and os.path.isfile(model_path) and not overwrite:
+        if _use_cached_model(model_path):
+            pipeline = joblib.load(model_path)            
+            cached_targets = list(getattr(pipeline, "target_names_in_", []))
+            assert cached_targets == targets, (
+                f"\n{os.path.basename(model_path)} was fit on {cached_targets or 'unrecorded target(s)'}, not on {targets}. "
+                "Refit it by setting 'overwrite' to True.\n"
+            )
             custom_print(f"Loaded pre-trained: {model_path}")
-            return joblib.load(model_path)
 
-        model.fit(X_fit, y_fit)
+        else:
+            pipeline.fit(_get_features(idx), _get_targets(idx))
+            pipeline.target_names_in_ = targets  # not a property of sklearn
 
-        if model_path:
-            joblib.dump(model, model_path)
-            custom_print(f"\nSaved: {model_path}\n")
+            if model_path:
+                joblib.dump(pipeline, model_path)
+                custom_print(f"\nSaved: {model_path}\n")
 
-        return model
+        return pipeline
 
-    def _calc_model_perf(y_true: np.ndarray, y_pred: np.ndarray):
-        err = y_true - y_pred
-        mae = np.mean(np.abs(err))
-        r2 = 1 - np.sum(err ** 2) / np.sum((y_true - y_true.mean()) ** 2)
-        return {"MAE": mae, "R2": r2}
+    def _predict(pipeline, idx: np.ndarray) -> np.ndarray:
+        # returns in a 2-D shape even if n_targets == 1, whose default is (n,) instead of (n, 1) 
+        return np.asarray(
+            pipeline.predict(_get_features(idx))
+        ).reshape(len(idx), n_targets)
 
-    def _fit_calibrator(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    def _calc_model_perf(idx: np.ndarray):
+        perf = {}
+
+        for i, target in enumerate(targets):
+            err = y_arr[idx, i] - y_pred[idx, i]
+            mae = np.mean(np.abs(err))
+            r2 = 1 - np.sum(err ** 2) / np.sum((y_arr[idx, i] - y_arr[idx, i].mean()) ** 2)
+            perf.update({
+                f"MAE_{target}": mae, 
+                f"R2_{target}": r2
+            })
+
+        return perf
+
+    def _fit_calibrator(idx: np.ndarray) -> dict[str, float]:
         '''
-        Fit a simple linear regression of `y_pred` on `y_true`,
+        For every target, 
+        fit a simple linear regression of predictions on the true values,
         which will then be used to reverse-transform the predictions
         using the resulting slope and intercept.
         (i.e., Apply age prediction correction with Cole's method).
 
         Called on one fold's held-out rows.
         '''
-        coefs = np.polyfit(y_true, y_pred, 1)
-        return {"intercept": coefs[1], "slope": coefs[0]}
+        all_coefs = {}
+
+        for i, target in enumerate(targets):
+            coefs = np.polyfit(y_arr[idx, i], y_pred[idx, i], 1)
+            all_coefs.update({
+                f"const_{target}": coefs[1], 
+                f"slope_{target}": coefs[0]
+            })
+
+        return all_coefs
+
+    def _apply_calibrator(idx: np.ndarray, coefs: dict[str, float]):
+        for i, target in enumerate(targets):
+            y_pred_ac[idx, i] = (
+                (y_pred[idx, i] - coefs[f"const_{target}"]) / coefs[f"slope_{target}"]
+            )
 
     ## ------------------------------------------------------------------------------
 
@@ -464,11 +562,18 @@ def train_eval_model(
     model_perf_path = None if model_perf_path is None else str(model_perf_path)
     calib_param_path = None if calib_param_path is None else str(calib_param_path)
 
+    Y = y if isinstance(y, pd.DataFrame) else pd.DataFrame(np.asarray(y).reshape(len(y), -1)).add_prefix("y")
+    Y = Y.reset_index(drop=True)  # the indices below are positional
+    targets = Y.columns.to_list()
+    n_targets = len(targets)
+    y_arr = Y.to_numpy()
+
     _validate_inputs()
 
-    y_pred = np.full(len(y), np.nan, dtype=np.float32)
-    y_pred_ac = np.full(len(y), np.nan, dtype=np.float32) if apply_correction else None
-    fold_n = np.full(len(y), -1, dtype=np.int8)
+    n_samples = len(y_arr)
+    y_pred = np.full((n_samples, n_targets), np.nan, dtype=np.float32)
+    y_pred_ac = np.full_like(y_pred, np.nan) if apply_correction else None
+    fold_n = np.full(n_samples, -1, dtype=np.int8)
     perfs = []
     best_score = np.inf if perf_metrix == "MAE" else -np.inf
 
@@ -477,24 +582,16 @@ def train_eval_model(
 
         pipes, calibs = {}, {}
         for k, (tr, va) in enumerate(kf.split(idx_tr)):
-            pipes[k] = _fit_or_load(
-                suffix=f"fold-{k}",
-                model=_init_model(),
-                X_fit=_get_rows(idx_tr[tr]), 
-                y_fit=y[idx_tr[tr]]
-            )
-            y_pred[idx_tr[va]] = pipes[k].predict(_get_rows(idx_tr[va]))
-
-            if apply_correction:
-                calibs[k] = _fit_calibrator(y[idx_tr[va]], y_pred[idx_tr[va]])
-                y_pred_ac[idx_tr[va]] = (
-                    (y_pred[idx_tr[va]] - calibs[k]["intercept"]) / calibs[k]["slope"] 
-                )
-
+            pipes[k] = _fit_or_load(f"fold-{k}", _init_pipeline(), idx_tr[tr])
+            y_pred[idx_tr[va]] = _predict(pipes[k], idx_tr[va])
             fold_n[idx_tr[va]] = k
 
-            perf_va = _calc_model_perf(y[idx_tr[va]], y_pred[idx_tr[va]])
-            score = perf_va[perf_metrix]
+            if apply_correction:
+                calibs[k] = _fit_calibrator(idx_tr[va])
+                _apply_calibrator(idx_tr[va], calibs[k])
+           
+            perf_va = _calc_model_perf(idx_tr[va])
+            score = np.mean([ perf_va[f"{perf_metrix}_{t}"] for t in targets ])
 
             improved = (score < best_score) if perf_metrix == "MAE" else (score > best_score)
             if improved:
@@ -503,48 +600,39 @@ def train_eval_model(
 
             if model_perf_path:
                 perfs.append(
-                    {"Split": f"Val_fold-{k}", "N": len(idx_tr[va]), "MAE": perf_va["MAE"], "R2": perf_va["R2"]}
+                    {"Split": f"Val_fold-{k}", "N": len(idx_tr[va]), **perf_va}
                 )
 
         best_pipe = pipes[best_fold]
-        y_pred[idx_te] = best_pipe.predict(_get_rows(idx_te))
+        y_pred[idx_te] = _predict(best_pipe, idx_te)
 
         if apply_correction:
-            best_calib = calibs[best_fold]
-            y_pred_ac[idx_te] = (
-                (y_pred[idx_te] - best_calib["intercept"]) / best_calib["slope"]
-            )
+            _apply_calibrator(idx_te, calibs[best_fold])
 
         if model_perf_path:
-            fold_mae = np.array([ p["MAE"] for p in perfs ])
-            fold_r2  = np.array([ p["R2"] for p in perfs ])
-            perf_tr = _calc_model_perf(y[idx_tr], y_pred[idx_tr])
-            perf_te = _calc_model_perf(y[idx_te], y_pred[idx_te])
+            fold_perfs = pd.DataFrame(perfs).drop(columns=["Split", "N"])
+            perf_tr = _calc_model_perf(idx_tr)
+            perf_te = _calc_model_perf(idx_te)
             perfs += [
-                {"Split": "Val_mean"  , "N": None       , "MAE": fold_mae.mean()     , "R2": fold_r2.mean()},
-                {"Split": "Val_SD"    , "N": None       , "MAE": fold_mae.std(ddof=1), "R2": fold_r2.std(ddof=1)},
-                {"Split": "Val_pooled", "N": len(idx_tr), "MAE": perf_tr["MAE"]      , "R2": perf_tr["R2"]}, 
-                {"Split": "Test"      , "N": len(idx_te), "MAE": perf_te["MAE"]      , "R2": perf_te["R2"]}
+                {"Split": "Val_mean"  , "N": None       , **fold_perfs.mean().to_dict()},
+                {"Split": "Val_SD"    , "N": None       , **fold_perfs.std(ddof=1).to_dict()},
+                {"Split": "Val_pooled", "N": len(idx_tr), **perf_tr}, 
+                {"Split": "Test"      , "N": len(idx_te), **perf_te}
             ]
 
     else: # both predict by the model train on entire training set
-        pipe = _fit_or_load(
-            suffix="all",
-            model=_init_model(),
-            X_fit=_get_rows(idx_tr),
-            y_fit=y[idx_tr]
-        )
-        y_pred[idx_tr] = pipe.predict(_get_rows(idx_tr))
+        pipe = _fit_or_load("all", _init_pipeline(), idx_tr)
+        y_pred[idx_tr] = _predict(pipe, idx_tr)
         fold_n[idx_tr] = 0
 
-        y_pred[idx_te] = pipe.predict(_get_rows(idx_te))
+        y_pred[idx_te] = _predict(pipe, idx_te)
 
         if model_perf_path:
-            perf_tr = _calc_model_perf(y[idx_tr], y_pred[idx_tr])
-            perf_te = _calc_model_perf(y[idx_te], y_pred[idx_te])
+            perf_tr = _calc_model_perf(idx_tr)
+            perf_te = _calc_model_perf(idx_te)
             perfs += [
-                {"Split": "Train", "N": len(idx_tr), "MAE": perf_tr["MAE"], "R2": perf_tr["R2"]},
-                {"Split": "Test" , "N": len(idx_te), "MAE": perf_te["MAE"], "R2": perf_te["R2"]}
+                {"Split": "Train", "N": len(idx_tr), **perf_tr},
+                {"Split": "Test" , "N": len(idx_te), **perf_te}
             ]
         
     if model_perf_path:
@@ -552,7 +640,7 @@ def train_eval_model(
         perfs["N"] = perfs["N"].astype("Int64")  # nullable int
         perfs.to_csv(model_perf_path, index=False)
         custom_print(f"\nSaved: {model_perf_path}")
-        custom_print(f"Test MAE = {perf_te["MAE"]:.1f}")
+        custom_print("Test MAE: " + ", ".join( f"{t} = {perf_te[f'MAE_{t}']:.2f}" for t in targets ))
 
     if calib_param_path:
         calib_df = pd.DataFrame.from_dict(calibs, orient="index")
@@ -560,4 +648,41 @@ def train_eval_model(
         calib_df.to_csv(calib_param_path)
         custom_print(f"\nSaved: {calib_param_path}")
 
-    return y_pred, y_pred_ac, fold_n
+    return (
+        pd.DataFrame(y_pred, columns=targets), 
+        pd.DataFrame(y_pred_ac, columns=targets) if apply_correction else None, 
+        fold_n
+    )
+
+
+class TargetScaler(BaseEstimator, TransformerMixin):
+    '''
+    Scale multi-output targets relative to the first column.
+
+    Notes
+    -----
+    - NaNs are ignored when estimating mean and std, 
+      but are preserved in `transform` and `inverse_transform`.
+    - `y` argument exists only for API compatibility.
+    '''
+    def fit(self, X: np.ndarray, y: np.ndarray = None):
+        '''
+        Estimate per-column nan-aware mean 
+        and a scale derived from nan-aware standard deviations
+        (expressed in units of column 0's std). 
+        '''
+        X = np.asarray(X, dtype=np.float64)
+        std = np.nanstd(X, axis=0)
+        std[std == 0] = 1.  # prevent division by zero for constant column(s)
+
+        self.center_ = np.nanmean(X, axis=0)
+        self.scale_ = std / std[0]
+
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return (np.asarray(X, dtype=np.float64) - self.center_) / self.scale_
+
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        return np.asarray(X, dtype=np.float64) * self.scale_ + self.center_
+

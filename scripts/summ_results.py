@@ -3,12 +3,16 @@
 
 import argparse
 import os
-import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import joblib
+
+from predict_ages import SID, SET, AGE
+
+
+TARG_COL, FEAT_COL = "Target", "Feature"
 
 
 class Config:
@@ -55,8 +59,8 @@ def load_preds(preds_path: Path) -> tuple[pd.DataFrame, list[str]]:
     the column names of the predictions from the evaluated models (Age_*; to collect model names).
     No selection applied.
     '''
-    df = pd.read_csv(preds_path, index_col="SID")
-    cols = [ c for c in df.columns if c.startswith("Age_") ]
+    df = pd.read_csv(preds_path, index_col=SID)
+    cols = [ c for c in df.columns if c.startswith(f"{AGE}_") ]
     
     print(f"\nLoaded predictions from folder: {preds_path.parent}")
     print(f"{len(cols)} model(s), {len(df)} participant(s).\n")
@@ -73,15 +77,15 @@ def calc_fits(preds_df: pd.DataFrame, preds_cols: list[str]) -> pd.DataFrame:
     rows = []
 
     for split in ["all", "test", "train"]:
-        sub_df = preds_df if split == "all" else preds_df[preds_df["Set"] == split]
+        sub_df = preds_df if split == "all" else preds_df[preds_df[SET] == split]
 
         if not len(sub_df):
             continue
 
-        y_true_full = sub_df["Age"].to_numpy(dtype=float)
+        y_true_full = sub_df[AGE].to_numpy(dtype=float)
 
         for p_col in preds_cols:
-            model = p_col.replace("Age_", "") if "Final" not in p_col else "Final"
+            model = p_col.replace(f"{AGE}_", "") if "Final" not in p_col else "Final"
             y_pred_full = sub_df[p_col]
 
             mask = ~np.isnan(y_pred_full)
@@ -115,7 +119,7 @@ def calc_fits(preds_df: pd.DataFrame, preds_cols: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def load_coefs(lv2_model_paths: list[Path]):
+def load_coefs(lv2_model_paths: list[Path]) -> pd.DataFrame:
     '''
     Read the weights of the second-level models from each fold.
     '''
@@ -123,18 +127,28 @@ def load_coefs(lv2_model_paths: list[Path]):
     coefs_dict = {}
 
     for path in lv2_model_paths:  # pipline fit on each fold
-        pipe = joblib.load(path)
-        model = pipe.named_steps["model"]
         fold_n = int(path.stem.split("-")[-1])
 
+        pipe = joblib.load(path)
+        model = pipe.named_steps["model"]
+        model = getattr(model, "regressor_", model)  # for TransformedTargetRegressor
+
+        coefs = np.atleast_2d(model.coef_)
+        targets = list(getattr(pipe, "target_names_in_", []))
+        
         feats = list(getattr(pipe, "feature_names_in_", []))
         assert F is None or set(feats) == set(F), f"\nFeature set in fold-{fold_n} differ from the other cycles\n"
         F = feats
-
-        coefs = model.coef_
-        assert len(feats) == len(coefs), f"\nThe pipeline names {len(feats)} feature(s) but carries {len(coefs)} weight(s)\n"
         
-        coefs_dict[fold_n] = pd.Series(coefs, index=[ f.removeprefix("Age_") for f in feats ])
+        assert coefs.shape == (len(targets), len(feats)), (
+            f"\nThe pipeline names {len(targets)} target(s) and {len(feats)} feature(s), "
+            f"but carries a {coefs.shape} weight matrix\n"
+        )
+
+        coefs_dict[fold_n] = pd.Series(
+            coefs.ravel(), 
+            index=pd.MultiIndex.from_product([targets, feats], names=[TARG_COL, FEAT_COL])
+        )
 
     return pd.DataFrame.from_dict(coefs_dict)
 
