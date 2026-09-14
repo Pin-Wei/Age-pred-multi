@@ -49,7 +49,7 @@ class Config(OrigConfig):
         super().__init__(args)
 
         self.modes = list(args.modes)
-        self.metrics = METRICS
+        self.metrics = METRICS + ORIG_METRICS
         self.score_by = args.score_by
         self.score_sign = {"MAE": 1, "R2": -1}[self.score_by.split("_")[1]]
 
