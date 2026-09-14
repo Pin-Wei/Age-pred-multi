@@ -470,7 +470,7 @@ def train_eval_model(
     y_pred_ac = np.full(len(y), np.nan, dtype=np.float32) if apply_correction else None
     fold_n = np.full(len(y), -1, dtype=np.int8)
     perfs = []
-    best_score = np.inf if perf_metrix == "MAE" else 0
+    best_score = np.inf if perf_metrix == "MAE" else -np.inf
 
     if n_folds > 1:
         kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
@@ -496,7 +496,8 @@ def train_eval_model(
             perf_va = _calc_model_perf(y[idx_tr[va]], y_pred[idx_tr[va]])
             score = perf_va[perf_metrix]
 
-            if ((perf_metrix == "MAE") and (score < best_score)) or (score > best_score):
+            improved = (score < best_score) if perf_metrix == "MAE" else (score > best_score)
+            if improved:
                 best_score = score
                 best_fold = k
 
