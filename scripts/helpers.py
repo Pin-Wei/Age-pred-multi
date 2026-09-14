@@ -405,6 +405,7 @@ def train_eval_model(
         import optuna
         import optunahub
         from xgboost import XGBRegressor
+        from sklearn.metrics import make_scorer, mean_absolute_error
         from sklearn.model_selection import KFold, cross_val_score
 
     def _validate_inputs():
@@ -462,6 +463,11 @@ def train_eval_model(
 
     def _get_targets(idx: np.ndarray) -> np.ndarray:
         return y_arr[idx] if n_targets > 1 else y_arr[idx, 0]
+
+    def _get_target_scales(idx: np.ndarray) -> np.ndarray:
+        stds = np.nanstd(y_arr[idx], axis=0)
+        stds[stds == 0] = 1.
+        return stds / stds[0]
 
     def _init_pipeline(temp_xgb_params: dict | None = None):
         multi = n_targets > 1
@@ -527,7 +533,12 @@ def train_eval_model(
             X=_get_features(idx), 
             y=_get_targets(idx), 
             cv=KFold(n_splits=5, shuffle=True, random_state=seed_inner), 
-            scoring="neg_mean_absolute_error", 
+            scoring=(
+                make_scorer(  # weight every target by its own std, as TargetScaler does
+                    mean_absolute_error, greater_is_better=False, 
+                    multioutput=1 / _get_target_scales(idx)
+                ) if n_targets > 1 else "neg_mean_absolute_error"
+            ), 
             n_jobs=n_jobs, 
             verbose=verbose
         )
