@@ -15,6 +15,15 @@ from utils import custom_print
 MODEL_TYPES = ["elasticnet", "lasso", "ridge", "xgboost"]
 L1_RATIOS = [.1, .5, .7, .9, .95, .99, 1]
 ALPHAS = [1e-1, 1.0, 3.0, 1e1, 3e1, 1e2, 3e2, 1e3, 1e4, 1e5]
+XGB_PARAM_SPACE = {
+    "max_depth"       : lambda t: t.suggest_int("max_depth", 1, 9),
+    "learning_rate"   : lambda t: t.suggest_float("learning_rate", 1e-4, 1.0, log=True),
+    "n_estimators"    : lambda t: t.suggest_int("n_estimators", 100, 1000),
+    "min_child_weight": lambda t: t.suggest_int("min_child_weight", 1, 10),
+    "subsample"       : lambda t: t.suggest_float("subsample", 0.1, 1.0),
+    "colsample_bytree": lambda t: t.suggest_float("colsample_bytree", 0.1, 1.0), 
+    # "max_bin"         : lambda t: t.suggest_int("max_bin", 32, 128)
+}
 
 
 def print_missing(all_subjs: list[str], data_subjs: list[str]) -> list[str]:
@@ -403,7 +412,7 @@ def train_eval_model(
 
     if model_type == "xgboost":
         import optuna
-        import optunahub
+        # import optunahub
         from xgboost import XGBRegressor
         from sklearn.metrics import make_scorer, mean_absolute_error
         from sklearn.model_selection import KFold, cross_val_score
@@ -496,7 +505,6 @@ def train_eval_model(
             "xgboost": lambda: XGBRegressor(
                 **xgb_params, 
                 **(temp_xgb_params or best_xgb_params), 
-                max_bin=64, 
                 multi_strategy="multi_output_tree" if multi else "one_output_per_tree", 
                 random_state=seed_inner, 
                 n_jobs=n_jobs, 
@@ -517,17 +525,10 @@ def train_eval_model(
         return Pipeline(steps=steps)
 
     def _eval_xgb_params(trial, idx: np.ndarray):
-        space = {
-            "max_depth"       : lambda: trial.suggest_int("max_depth", 1, 9),
-            "learning_rate"   : lambda: trial.suggest_float("learning_rate", 1e-4, 1.0, log=True),
-            "n_estimators"    : lambda: trial.suggest_int("n_estimators", 100, 1000),
-            "min_child_weight": lambda: trial.suggest_int("min_child_weight", 1, 10),
-            "subsample"       : lambda: trial.suggest_float("subsample", 0.1, 1.0),
-            "colsample_bytree": lambda: trial.suggest_float("colsample_bytree", 0.1, 1.0), 
-            # "max_bin"         : lambda: trial.suggest_int("max_bin", 32, 128)
+        params = {
+            k: fun(trial) for k, fun in XGB_PARAM_SPACE.items() 
+            if k not in xgb_params.keys()
         }
-        params = { k: fun() for k, fun in space.items() if k not in xgb_params.keys() }
-
         neg_mae_scores = cross_val_score(
             estimator=_init_pipeline(temp_xgb_params=params), 
             X=_get_features(idx), 
@@ -542,17 +543,17 @@ def train_eval_model(
             n_jobs=n_jobs, 
             verbose=verbose
         )
-
         return -1 * np.mean(neg_mae_scores)
 
     def _optimize_xgb_params(idx: np.ndarray):
-        try:
-            module = optunahub.load_module(package="samplers/auto_sampler")
-            sampler = module.AutoSampler(seed=seed_inner)
-        except Exception as e:
-            reason = str(e).splitlines()[0] if str(e) else type(e).__name__
-            custom_print(f"\nFalling back on TPESampler, AutoSampler is unavailable: {reason}", level="WARNING")
-            sampler = optuna.samplers.TPESampler(seed=seed_inner)
+        # try:
+        #     module = optunahub.load_module(package="samplers/auto_sampler")
+        #     sampler = module.AutoSampler(seed=seed_inner)
+        # except Exception as e:
+        #     reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+        #     custom_print(f"\nFalling back on TPESampler, AutoSampler is unavailable: {reason}", level="WARNING")
+        #     sampler = optuna.samplers.TPESampler(seed=seed_inner)
+        sampler = optuna.samplers.TPESampler(seed=seed_inner)
 
         optuna.logging.set_verbosity(optuna.logging.INFO if verbose > 0 else optuna.logging.WARNING)
         custom_print(f"\nSearching the XGBoost hyperparameters over {opt_trials} trial(s) ...")
@@ -656,10 +657,19 @@ def train_eval_model(
     best_score = np.inf if perf_metrix == "MAE" else -np.inf
 
     best_xgb_params = {}
-    if model_type == "xgboost" and bool(model_path_template):
-        suffixes = [ f"fold-{k}" for k in range(n_folds) ] if n_folds > 1 else [ "all" ]
-        model_paths = [ model_path_template.format(s) for s in suffixes ]
-        if not all( _use_cached_model(p) for p in model_paths ):
+    if model_type == "xgboost":
+        skip_tune = False
+        if not (XGB_PARAM_SPACE.keys() - xgb_params.keys()):
+            custom_print("\n'xgb_params' fixes every tunable hyperparameter; no search is needed.\n")
+            skip_tune = True
+        if (not skip_tune) and bool(model_path_template):
+            suffixes = [ f"fold-{k}" for k in range(n_folds) ] if n_folds > 1 else [ "all" ]
+            model_paths = [ model_path_template.format(s) for s in suffixes ]
+            skip_tune = all( _use_cached_model(p) for p in model_paths )
+            if skip_tune:
+                custom_print("\nEvery model is already trained; the hyperparameter search is skipped.\n")
+        if not skip_tune:
+            assert opt_trials > 0, "To perform hyperparameter tuning, `opt_trials` must be greater than zero."
             best_xgb_params = _optimize_xgb_params(idx_tr)
 
     if n_folds > 1:
