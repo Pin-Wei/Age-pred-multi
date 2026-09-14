@@ -198,6 +198,9 @@ def tee_output(log_path: Path):
         for fd in saved_fds:
             os.close(fd)
         proc.stdin.close()
-        proc.wait()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # the resource trackers of loky / multiprocessing hold the pipe until this process exits
+            pass
 
 
