@@ -17,7 +17,7 @@ from utils import to_json_compatible, tee_output
 
 
 SID, SET, AGE, COG = "SID", "Set", "Age", "Cog"  # column names
-TARGETS = [AGE, COG]
+TARGETS = [[AGE], [AGE, COG]]
 
 
 class Config:
@@ -27,6 +27,7 @@ class Config:
         self.setup_vars_and_paths(args)
 
     def setup_model_params(self, args):
+        self.targets = TARGETS[args.targets]
         self.model_lv1 = args.model_lv1
         self.model_lv2 = args.model_lv2
         self.l1_ratios = list(args.l1_ratios)
@@ -55,7 +56,7 @@ class Config:
         self.cog_score_path = self.tbl_dir / "cog_scores.json"
         self.pyment_tbl_path = self.proj_root / "data" / "pyment" / "predictions" / "predictions.csv"
         
-        lv1_key = f"{len(TARGETS)}y_{self.model_lv1}_cv{self.n_folds}_{self.seed}"
+        lv1_key = f"{len(self.targets)}y_{self.model_lv1}_cv{self.n_folds}_{self.seed}"
         if args.add_new_mdls:
             while (self.proj_root / "models" / lv1_key).is_dir():
                 lv1_key += "+"
@@ -177,6 +178,9 @@ def parse_args(
     )
 
     grp_model = parser.add_argument_group("model")
+    grp_model.add_argument("--targets", type=int, choices=range(len(TARGETS)), default=1, 
+                           help="The target(s) for models to predict. " + 
+                                ", ".join([ f'{i}: {x}' for i, x in enumerate(TARGETS) ]))
     grp_model.add_argument("--model_lv1", choices=MODEL_TYPES, default=MODEL_TYPES[0],
                            help="Type of regression algorithm to use for first-level models")
     grp_model.add_argument("--model_lv2", choices=MODEL_TYPES, default=MODEL_TYPES[2],
@@ -227,7 +231,7 @@ def load_targets(config: Config) -> pd.DataFrame:
     subj_df.index.name = SID
     subj_df = subj_df.rename(columns={"BASIC_INFO_AGE": AGE})
 
-    if COG in TARGETS:
+    if COG in config.targets:
         assert config.cog_score_path.is_file(), f"\n'{config.cog_score_path.name}' not exists; run make_df_scores.py first\n"
         cog_data = json.loads(config.cog_score_path.read_text())
         cog_scores = pd.Series(cog_data["scores"])
@@ -235,7 +239,7 @@ def load_targets(config: Config) -> pd.DataFrame:
         print_missing(subj_df.index.to_list(), cog_scores.index.to_list())
         subj_df[COG] = cog_scores
 
-    return subj_df.loc[:, [SET] + TARGETS]
+    return subj_df.loc[:, [SET] + config.targets]
 
 
 def load_data(f_name: str, config: Config) -> tuple[list[str], np.ndarray | pd.DataFrame]:
@@ -272,7 +276,7 @@ def run_lv1_models(subj_df: pd.DataFrame, config: Config) -> tuple[list[pd.DataF
         subj_list, X = load_data(f_name, config)
         missing = print_missing(subj_df.index.to_list(), subj_list)
 
-        y = subj_df.loc[subj_list, TARGETS].astype(np.float32)
+        y = subj_df.loc[subj_list, config.targets].astype(np.float32)
         sets = subj_df.loc[subj_list, SET].to_numpy(dtype=str)
         idx_tr = np.where(sets == "train")[0]
         idx_te = np.where(sets == "test")[0]
@@ -360,7 +364,7 @@ def add_pyment_results(pred_out: pd.DataFrame, summ_by_feat: dict, config: Confi
 def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) -> tuple[pd.DataFrame, dict]:
     lv1_pred_cols = [ 
         f"{target}_{f_name}" 
-        for f_name in config.feat_types for target in TARGETS 
+        for f_name in config.feat_types for target in config.targets 
         if f"{target}_{f_name}" in pred_out.columns
     ]
     sets = pred_out[SET].to_numpy(dtype=str)
@@ -370,7 +374,7 @@ def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) ->
     print(f"\nTrain and eval the final {config.model_lv2} model on the {len(lv1_pred_cols)} first-level prediction(s) ...")
     y_pred, y_pred_ac, _ = train_eval_model(
         X=pred_out.loc[:, lv1_pred_cols].astype(np.float32), 
-        y=pred_out.loc[:, TARGETS].astype(np.float32),
+        y=pred_out.loc[:, config.targets].astype(np.float32),
         idx_tr=idx_tr,
         idx_te=idx_te,
         model_type=config.model_lv2,

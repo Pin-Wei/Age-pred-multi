@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from make_df_scores import SCORE_KEY
-from predict_ages import SET, AGE, TARGETS
+from predict_ages import SET, AGE, COG
 import calc_corr
 from summ_results import TARG_COL, FEAT_COL, load_preds
 from plotting import (
@@ -92,7 +92,7 @@ def feat_to_block(feat: str) -> str:
     (e.g., "Age_MRI_ROI" -> "MRI_ROI")
     '''
     target, _, block = feat.partition("_")
-    if (target in TARGETS) and (block != ""):
+    if (target in [AGE, COG]) and (block != ""):
         return block
     else:
         return feat

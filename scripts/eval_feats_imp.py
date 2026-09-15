@@ -15,7 +15,7 @@ import pandas as pd
 from helpers import train_eval_model
 from predict_ages import Config as OrigConfig
 from predict_ages import parse_args as orig_parse_args
-from predict_ages import SID, SET, TARGETS, load_targets
+from predict_ages import SID, SET, AGE, COG, load_targets
 from utils import mute_print, to_json_compatible, tee_output
 
 
@@ -26,10 +26,6 @@ MODES = [["only_one", "drop_one"],
 METRICS = [  # averaged over the targets; what the ranking and the organized table use
     f"{split}_{stat}"
     for split in ["Val", "Test"] for stat in ["MAE", "R2"]
-]
-ORIG_METRICS = [  # the original metrices as in the performance table
-    f"{m}_{target}"
-    for m in METRICS for target in TARGETS
 ]
 METRIC_IDX = {  # split -> prefix of row indices in the performance table to be recorded 
     "Val" : "Val_pooled", 
@@ -49,12 +45,16 @@ class Config(OrigConfig):
         super().__init__(args)
 
         self.modes = list(args.modes)
-        self.metrics = METRICS + ORIG_METRICS
+        self.metrics = METRICS
+        self.orig_metircs = [  # the original metrices as in the performance table
+            f"{m}_{target}"
+            for m in METRICS for target in self.targets
+        ]
         self.score_by = args.score_by
         self.score_sign = {"MAE": 1, "R2": -1}[self.score_by.split("_")[1]]
 
     def setup_model_params(self, args):
-        super().setup_model_params(args)  # --seed, --model-lv2, --n-jobs, --verbose, ... are handled there
+        super().setup_model_params(args)  # --seed, --model_lv2, --n_jobs, --verbose, ... are handled there
         if args.seeds:
             self.seeds = list(args.seeds)
         else:
@@ -76,7 +76,7 @@ class Config(OrigConfig):
         }[self.feat_src]
 
         self.block_pattern = {
-            "targ-preds"  : rf"^(?:{'|'.join(TARGETS)})_(?!Final$)(?P<block>.+)$",  # 1 column per target per block
+            "targ-preds"  : rf"^(?:{'|'.join(self.targets)})_(?!Final$)(?P<block>.+)$",  # 1 column per target per block
             "cross-decomp": r"^(?P<block>.+)_PLS\d+$"  # k columns per block
         }[self.feat_src]
 
@@ -101,12 +101,12 @@ class Lv2Data:
     '''
     Packaged data for second-level model(s)
     '''
-    def __init__(self, df: pd.DataFrame, blocks: dict[str, list[str]]):
+    def __init__(self, df: pd.DataFrame, targets: list[str], blocks: dict[str, list[str]]):
         self.df = df  # first-level models' output table; holds SID, SET, "Age" plus several feature columns
         self.blocks = blocks  # {block_name: cols_match_block_pattern}; in table order
         self.block_names = list(blocks.keys())
 
-        self.y = df.loc[:, TARGETS].astype(np.float32)
+        self.y = df.loc[:, targets].astype(np.float32)
         sets = df[SET].to_numpy(dtype=str)
         self.idx_tr = np.where(sets == "train")[0]
         self.idx_te = np.where(sets == "test")[0]
@@ -132,7 +132,7 @@ class Lv2Data:
         '''
         Participant identifiers and the targets, to be carried by every prediction table
         '''
-        cols = [ c for c in [SID, SET] + TARGETS if c in self.df.columns ]
+        cols = [ c for c in [SID, SET, AGE, COG] if c in self.df.columns ]
         return self.df[cols].copy()
 
 
@@ -165,7 +165,7 @@ def parse_args(argv: list[str] = None) -> argparse.Namespace:
     grp_search = parser.add_argument_group("search")
     grp_search.add_argument("--modes", nargs="+", choices=MODES, default=MODES, metavar="MODE",
                             help=f"searches to run, in order; from {MODES}")
-    grp_search.add_argument("--score_by", choices=METRICS + ORIG_METRICS, default=f"Test_R2",
+    grp_search.add_argument("--score_by", choices=METRICS, default=f"Test_R2",
                             help="metric that drives the stepwise choices and the importance deltas")
 
     grp_refit = parser.add_argument_group("refitting")
@@ -196,11 +196,11 @@ def load_lv2_data(config: Config) -> Lv2Data:
 
     assert blocks, f"\nNo column of {config.feat_tbl_path.name} matches r'{config.block_pattern}'\n"
 
-    if not {SET, *TARGETS}.issubset(df.columns):
+    if not {SET, *config.targets}.issubset(df.columns):
         subj_df = load_targets(config).reset_index()
         df = pd.merge(subj_df, df, on=SID, how="inner")
 
-    data = Lv2Data(df, blocks)
+    data = Lv2Data(df, config.targets, blocks)
     print(f"{len(df)} participants ({len(data.idx_tr)} train, {len(data.idx_te)} test)")
     print(f"{len(blocks)} feature blocks, {sum(map(len, blocks.values()))} features:")
     for name, cols in blocks.items():
@@ -250,15 +250,15 @@ def evaluate_subset(blocks_selected: list[str], data: Lv2Data, config: Config, c
         preds_ac[seed] = y_pred_ac
         orig_scores = {  # e.g., "Val_MAE_Age": perfs[seed].loc["Val_pooled", "MAE_Age"] 
             m: perfs[seed].loc[METRIC_IDX[m.split("_")[0]], m.split("_", 1)[1]] 
-            for m in ORIG_METRICS
+            for m in config.orig_metircs
         }
         fair_scores = {  # m.split("_")[-1] is target
             m: orig_scores[m] / (data.scales[m.split("_")[-1]] if "MAE" in m else 1.)
-            for m in ORIG_METRICS
+            for m in config.orig_metircs
         }
         runs.append({
             "Seed": seed, 
-            **{ m: float(np.mean([ fair_scores[f"{m}_{t}"] for t in TARGETS ])) for m in METRICS }, 
+            **{ m: float(np.mean([ fair_scores[f"{m}_{t}"] for t in config.targets ])) for m in METRICS }, 
             **orig_scores
         })
 
@@ -415,7 +415,7 @@ def make_pred_tables(entries: list[Entry], full_rec: dict, data: Lv2Data, config
 
         for entry in entries:
             subset = _name_subset(entry)
-            for target in TARGETS:
+            for target in config.targets:
                 df[f"{target}_{subset}"] = entry.record["Preds"][seed][target].to_numpy()
                 df[f"C-{target}_{subset}"] = entry.record["Preds_AC"][seed][target].to_numpy()
 
@@ -468,9 +468,9 @@ def main(config: Config):
     for seed, pred_df in pred_dfs.items():
         pred_path = Path(str(config.pred_path_tmpl).format(seed))
         pred_df.to_csv(pred_path, index=False)
-        n_models = (pred_df.shape[1] - n_id_cols) // (2 * len(TARGETS))
+        n_models = (pred_df.shape[1] - n_id_cols) // (2 * len(config.targets))
         print(f"Saved: {pred_path}")
-        print(f"({n_models} model(s), {len(TARGETS)} target(s), raw and corrected)\n")
+        print(f"({n_models} model(s), {len(config.targets)} target(s), raw and corrected)\n")
 
     ## Save the run's settings, the data it saw, and every evaluated record into one summary
     keep = lambda record: { k: v for k, v in record.items() if k not in ["Preds", "Preds_AC"] }  # kept in the tables above, not here
