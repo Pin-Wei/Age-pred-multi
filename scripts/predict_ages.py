@@ -106,7 +106,6 @@ class Config:
 
         tbss_dir          = self.proj_root / "data" / "dti" / "tbss"
         self.fa_3d_dir    = tbss_dir / "origdata"
-        self.fa_3d_paths  = list(self.fa_3d_dir.glob("*.nii.gz"))
         self.fa_4d_path   = tbss_dir / "stats" / f"all_FA{['', '_skeletonised'][skeleton]}.nii.gz"
         self.md_4d_path   = tbss_dir / "stats" / f"all_MD{['', '_skeletonised'][skeleton]}.nii.gz"
         self.fa_mask_path = tbss_dir / "stats" / f"mean_FA{['', '_skeleton'][skeleton]}_mask.nii.gz"
@@ -240,32 +239,27 @@ def load_targets(config: Config) -> pd.DataFrame:
 
 
 def load_data(f_name: str, config: Config) -> tuple[list[str], np.ndarray | pd.DataFrame]:
-    if f_name in ["DTI_FA", "DTI_MD"]:
-        subj_list = [ fp.name.split(".")[0] for fp in sorted(config.fa_3d_paths) ]  # the order TBSS merge per-subject FA volumes
-
     if f_name == "DTI_FA":
-        X = get_tbss_processed(
+        return get_tbss_processed(
             img_path=config.fa_4d_path, 
-            N=len(subj_list), 
+            subj_dir=config.fa_3d_dir, 
             stride=config.downsmple, 
             mask_path=config.fa_mask_path, 
             cache=config.fa_npy_path
         )
     elif f_name == "DTI_MD":
-        X = get_tbss_processed(
+        return get_tbss_processed(
             img_path=config.md_4d_path, 
-            N=len(subj_list), 
+            subj_dir=config.fa_3d_dir, 
             stride=config.downsmple, 
             mask_path=config.fa_mask_path, 
             cache=config.md_npy_path
         )
     elif f_name in config.sel_feats_by_name.keys():
         sel_feats = config.sel_feats_by_name[f_name]
-        subj_list, X = load_feat_table(config.tbl_paths[f_name], usecols=["BASIC_INFO_ID"]+sel_feats)
+        return load_feat_table(config.tbl_paths[f_name], usecols=["BASIC_INFO_ID"] + sel_feats)
     else:
-        subj_list, X = load_feat_table(config.tbl_paths[f_name])
-    
-    return subj_list, X
+        return load_feat_table(config.tbl_paths[f_name])
 
 
 def run_lv1_models(subj_df: pd.DataFrame, config: Config) -> tuple[list[pd.DataFrame], dict]:

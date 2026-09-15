@@ -95,17 +95,21 @@ def load_img_data(
 
 def get_tbss_processed(
     img_path: str | Path, 
-    N: int,
+    subj_dir: str | Path,
     stride: int, 
     mask_path: str | Path,
     cache: str | Path
-) -> np.ndarray:
+) -> tuple[list[str], np.ndarray]:
     '''
+    List the .nii.gz files under `subj_dir` and sort their names (participant IDs), 
+    which should be the order TBSS merge per-participant FA volumes.
+
     Load the 4-D TBSS stack from `img_path`, 
-    check its last axis against the expected participant count `N`, 
     downsample all three spatial axes by `stride`,
     keep the voxels whose value > 0 in the 3-D mask `mask_path`
     and flatten them per participant.
+
+    Return the participant IDs and the flattened (N, n_vox) array.
 
     If a processed NPY file (`cache`) exists
     and its sibling JSON file's key matches, reuse it;
@@ -118,7 +122,8 @@ def get_tbss_processed(
         '''
         The identity of the result, which includes:
         - The file name and byte size of the source and mask images
-        - `stride` and `N`
+        - `stride`
+        - The participant IDs, in the order of the volumes
         '''
         def _stat(p):
             p = str(p)
@@ -128,7 +133,7 @@ def get_tbss_processed(
             "img"   : _stat(img_path),
             "mask"  : _stat(mask_path),
             "stride": int(stride),
-            "N"     : int(N)
+            "SID"   : subj_list
         }
 
     cache = Path(cache)
@@ -136,6 +141,8 @@ def get_tbss_processed(
         cache = cache.with_name(cache.name + ".npy")
         
     key_path = cache.with_suffix(".json")
+    subj_list = [ fp.name.split(".")[0] for fp in sorted(Path(subj_dir).glob("*.nii.gz")) ]
+    has_sources = bool(subj_list) and os.path.isfile(img_path) and os.path.isfile(mask_path)
     key = _cache_key()
 
     if cache.exists():
@@ -144,19 +151,35 @@ def get_tbss_processed(
         except (OSError, ValueError):
             cached_key = None
 
+        if not has_sources:
+            msg1 = "\nThe source images are not found, "
+            msg2 = f"\nRebuild {cache.name} where the source images are.\n"
+            assert cached_key, (msg1 + "nor a readable cache key exists." + msg2)
+            assert "SID" in cached_key, (msg1 + f"and {key_path.name} holds no participant IDs." + msg2)
+            assert cached_key.get("stride") == int(stride), (msg1 + f"yet the cache is built with a stride size of {cached_key.get("stride")}." + msg2)
+            custom_print(f"Loaded from cache, without the source images to check it against: {cache}", level="WARNING")
+            return cached_key["SID"], np.load(cache, mmap_mode="r")
+
         if cached_key == key:
             custom_print(f"Loaded from cache: {cache}")
-            return np.load(cache, mmap_mode="r")
+            return subj_list, np.load(cache, mmap_mode="r")
 
         stale = (
             "no readable cache key" if cached_key is None 
-            else ", ".join( f"{k}: {cached_key.get(k)!r} -> {v!r}" for k, v in key.items() if cached_key.get(k) != v )
+            else ", ".join(
+                "participant IDs" if k == "SID" else f"{k}: {cached_key.get(k)!r} -> {v!r}" 
+                for k, v in key.items() if cached_key.get(k) != v
+            )
         )
         custom_print(f"Stale cache, recomputing ({stale}): {cache}", level="WARNING")
 
+    assert has_sources, (
+        f"\nCannot build {cache.name}; the source images are not found "
+        f"(stack: {img_path}, mask: {mask_path}, per-participant images: {subj_dir})\n"
+    )
     img_dat = load_img_data(img_path)
-    N_v = img_dat.shape[-1]
-    assert N_v == N, f"Mismatch between volume ({N_v}) and globbed ({N}) subject count."
+    N = img_dat.shape[-1]
+    assert N == len(subj_list), f"Mismatch between volume ({N}) and globbed ({len(subj_list)}) subject count."
     
     img_dat = img_dat[::stride, ::stride, ::stride, :]
     img_dat = np.moveaxis(img_dat, -1, 0)  # (N, X, Y, Z)
@@ -167,11 +190,19 @@ def get_tbss_processed(
 
     img_flat = img_dat[:, bin_mask].copy()  # (N, n_vox)
 
+    if cache.exists():  # keep the old cache and its key
+        old = cache.with_name(cache.stem + "_old")
+        while old.with_suffix(".npy").exists():
+            old = old.with_name(old.name + "+")
+        os.replace(src=cache, dst=old.with_suffix(".npy"))
+        if key_path.exists():
+            os.replace(key_path, old.with_suffix(".json"))
+
     np.save(cache, img_flat)
     key_path.write_text(json.dumps(key, indent=2))
     custom_print(f"Saved cache ({img_flat.nbytes / 1e9:.2f} GB): {cache}")
 
-    return img_flat
+    return subj_list, img_flat
 
 
 def load_feat_table(
