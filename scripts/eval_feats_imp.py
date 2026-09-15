@@ -266,6 +266,7 @@ def evaluate_subset(blocks_selected: list[str], data: Lv2Data, config: Config, c
                 xgb_params=config.xgb_params, 
                 opt_trials=config.opt_trials, 
                 n_jobs=config.n_jobs,
+                xgb_device=config.xgb_device, 
                 verbose=config.verbose,
                 impute_data=config.impute_data,
                 apply_correction=True,

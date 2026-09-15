@@ -307,6 +307,7 @@ def train_eval_model(
     xgb_params: dict = {}, 
     opt_trials: int = 100, 
     n_jobs: int = -1, 
+    xgb_device: str = "cpu", 
     verbose: int = 1, 
     impute_data: bool = False,
     perf_metrix: str = "MAE",
@@ -372,6 +373,11 @@ def train_eval_model(
 
     n_jobs : int, default=-1
         Number of CPU cores used for parallel execution (-1 uses all available).
+
+    xgb_device : {"cpu", "cuda"}, default="cpu"
+        Device on which the XGBoost models are trained. 
+        With "cuda", the folds of each Optuna trial are fitted one at a time, 
+        and a trial or a fit that runs out of GPU memory is repeated on the CPU.
 
     verbose : int, default=1
         Verbosity level of execution logs.
@@ -464,6 +470,7 @@ def train_eval_model(
         
         assert model_type in MODEL_TYPES, f"\nModel type '{model_type}' is undefined.\n"
         assert perf_metrix in {"MAE", "R2"}, f"\nPerformance metrix '{perf_metrix}' is undefined.\n"
+        assert xgb_device in {"cpu", "cuda"}, f"\nDevice '{xgb_device}' is invalid.\n"
 
         assert not (apply_correction and n_folds <= 1), (
             "\n'apply_correction' fits one slope per fold on that fold's held-out rows, "
@@ -509,7 +516,7 @@ def train_eval_model(
         stds[stds == 0] = 1.
         return stds / stds[0]
 
-    def _init_pipeline(temp_xgb_params: dict | None = None):
+    def _init_pipeline(temp_xgb_params: dict | None = None, device: str = xgb_device):
         multi = n_targets > 1
         _kf = KFold(n_splits=5, shuffle=True, random_state=seed_inner)
 
@@ -538,6 +545,7 @@ def train_eval_model(
                 **(temp_xgb_params or best_xgb_params), 
                 multi_strategy="multi_output_tree" if multi else "one_output_per_tree", 
                 random_state=seed_inner, 
+                device=device, 
                 n_jobs=n_jobs, 
                 verbosity=verbose
             )
@@ -555,25 +563,34 @@ def train_eval_model(
 
         return Pipeline(steps=steps)
 
-    def _eval_xgb_params(trial, idx: np.ndarray):
+    def _eval_xgb_params(trial, idx: np.ndarray, device: str = xgb_device):
         params = {
             k: fun(trial) for k, fun in XGB_PARAM_SPACE.items() 
             if k not in xgb_params.keys()
         }
-        neg_mae_scores = cross_val_score(
-            estimator=_init_pipeline(temp_xgb_params=params), 
-            X=_get_features(idx), 
-            y=_get_targets(idx), 
-            cv=KFold(n_splits=5, shuffle=True, random_state=seed_inner), 
-            scoring=(
-                make_scorer(  # weight every target by its own std, as TargetScaler does
-                    mean_absolute_error, greater_is_better=False, 
-                    multioutput=1 / _get_target_scales(idx)
-                ) if n_targets > 1 else "neg_mean_absolute_error"
-            ), 
-            n_jobs=n_jobs, 
-            verbose=verbose
-        )
+        try:
+            neg_mae_scores = cross_val_score(
+                estimator=_init_pipeline(temp_xgb_params=params, device=device), 
+                X=_get_features(idx), 
+                y=_get_targets(idx), 
+                cv=KFold(n_splits=5, shuffle=True, random_state=seed_inner), 
+                scoring=(
+                    make_scorer(  # weight every target by its own std, as TargetScaler does
+                        mean_absolute_error, greater_is_better=False, 
+                        multioutput=1 / _get_target_scales(idx)
+                    ) if n_targets > 1 else "neg_mean_absolute_error"
+                ), 
+                n_jobs=1 if (device == "cuda") else n_jobs, 
+                error_score="raise" if (device == "cuda") else np.nan,  # stop at the first fold that runs out of memory
+                verbose=verbose
+            )
+        except Exception as e:
+            if (device == "cuda") or ("out of memory" in str(e)):
+                custom_print(f"\nTrial {trial.number} runs out of GPU memory; evaluating it on the CPU instead.", level="WARNING")
+                return _eval_xgb_params(trial, idx, device="cpu")
+            else:
+                raise
+
         return -1 * np.mean(neg_mae_scores)
 
     def _optimize_xgb_params(idx: np.ndarray):
@@ -610,8 +627,16 @@ def train_eval_model(
             custom_print(f"Loaded pre-trained: {model_path}")
 
         else:
-            pipeline.fit(_get_features(idx), _get_targets(idx))
-            pipeline.target_names_in_ = targets  # not a property of sklearn
+            try:
+                pipeline.fit(_get_features(idx), _get_targets(idx))
+            except Exception as e:
+                if (model_type == "xgboost") and (xgb_device == "cuda") and ("out of memory" in str(e)):
+                    custom_print(f"\nThe '{suffix}' model runs out of GPU memory; fitting it on the CPU instead.", level="WARNING")
+                    pipeline = _init_pipeline(device="cpu")
+                else:
+                    raise
+
+            pipeline.target_names_in_ = targets  # self-define property
 
             if model_path:
                 joblib.dump(pipeline, model_path)
@@ -689,6 +714,9 @@ def train_eval_model(
 
     best_xgb_params = {}
     if model_type == "xgboost":
+        cuda_is_available = bool(XGBRegressor(tree_method="hist", device="cuda").fit([[0]], [0]))
+        xgb_device = "cpu" if not cuda_is_available else xgb_device
+        
         skip_tune = False
         if not (XGB_PARAM_SPACE.keys() - xgb_params.keys()):
             custom_print("\n'xgb_params' fixes every tunable hyperparameter; no search is needed.\n")

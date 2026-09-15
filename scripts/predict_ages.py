@@ -47,6 +47,7 @@ class Config:
         }
         self.opt_trials = args.opt_trials
         self.n_jobs = args.n_jobs
+        self.xgb_device = args.xgb_device
         self.verbose = args.verbose
         self.overwrite_mdl = args.overwrite_mdl
 
@@ -211,6 +212,8 @@ def parse_args(
     grp_run = parser.add_argument_group("runtime")
     grp_run.add_argument("--n_jobs", type=int, default=12, 
                          help="Number of CPU cores used for parallel execution; -1 uses all available")
+    grp_run.add_argument("--xgb_device", choices=["cpu", "cuda"], default="cuda", 
+                         help="Device on which the XGBoost models are trained; a fit that runs out of GPU memory is repeated on the CPU")
     grp_run.add_argument("--verbose", type=int, default=1, 
                          help="Verbosity level of execution logs")
     grp_run.add_argument("--overwrite_mdl", action="store_true",
@@ -294,6 +297,7 @@ def run_lv1_models(subj_df: pd.DataFrame, config: Config) -> tuple[list[pd.DataF
             xgb_params=config.xgb_params, 
             opt_trials=config.opt_trials, 
             n_jobs=config.n_jobs, 
+            xgb_device=config.xgb_device, 
             verbose=config.verbose, 
             impute_data=False, 
             model_path_template=config.model_paths[f_name], 
@@ -386,7 +390,8 @@ def run_lv2_model(pred_out: pd.DataFrame, summ_by_feat: dict, config: Config) ->
         max_iter=config.max_iter, 
         xgb_params=config.xgb_params, 
         opt_trials=config.opt_trials, 
-        n_jobs=config.n_jobs,
+        n_jobs=config.n_jobs, 
+        xgb_device=config.xgb_device, 
         verbose=config.verbose,
         impute_data=True,
         apply_correction=True,
