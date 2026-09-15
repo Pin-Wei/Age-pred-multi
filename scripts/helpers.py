@@ -156,7 +156,7 @@ def get_tbss_processed(
             msg2 = f"\nRebuild {cache.name} where the source images are.\n"
             assert cached_key, (msg1 + "nor a readable cache key exists." + msg2)
             assert "SID" in cached_key, (msg1 + f"and {key_path.name} holds no participant IDs." + msg2)
-            assert cached_key.get("stride") == int(stride), (msg1 + f"yet the cache is built with a stride size of {cached_key.get("stride")}." + msg2)
+            assert cached_key.get("stride") == int(stride), (msg1 + f"yet the cache is built with a stride size of {cached_key.get('stride')}." + msg2)
             custom_print(f"Loaded from cache, without the source images to check it against: {cache}", level="WARNING")
             return cached_key["SID"], np.load(cache, mmap_mode="r")
 
