@@ -25,6 +25,7 @@ class Config:
         args = parse_args([]) if args is None else args
         self.setup_model_params(args)
         self.setup_vars_and_paths(args)
+        self.only_run_lv1_models = args.only_run_lv1_models
 
     def setup_model_params(self, args):
         self.targets = TARGETS[args.targets]
@@ -177,6 +178,9 @@ def parse_args(
         description="Train and evaluate the two-level age-prediction pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+    parser.add_argument("--only_run_lv1_models", action="store_true", 
+                        help="Only run the first-order models; " + 
+                             "may be useful when you want to run the script in parallel on a different server.")
 
     grp_model = parser.add_argument_group("model")
     grp_model.add_argument("--targets", type=int, choices=range(len(TARGETS)), default=1, 
@@ -435,6 +439,9 @@ def main(config: Config):
     print(f"\nNumber of participants: {len(subj_df)}")
 
     pred_by_feat, summ_by_feat = run_lv1_models(subj_df, config)
+    if config.only_run_lv1_models:
+        exit()
+
     pred_out = merge_preds(subj_df, pred_by_feat)
     pred_out, summ_by_feat = add_pyment_results(pred_out, summ_by_feat, config)    
     pred_out, summ_out = run_lv2_model(pred_out, summ_by_feat, config)
