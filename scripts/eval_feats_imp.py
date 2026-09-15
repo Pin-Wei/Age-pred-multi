@@ -12,7 +12,7 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from helpers import train_eval_model
+from helpers import XGB_PARAM_SPACE, train_eval_model
 from predict_ages import Config as OrigConfig
 from predict_ages import parse_args as orig_parse_args
 from predict_ages import SID, SET, AGE, COG, load_targets
@@ -44,6 +44,9 @@ class Config(OrigConfig):
         self.lv2_key = args.lv2_key
         super().__init__(args)
 
+        if self.model_lv2 == "xgboost":
+            self.xgb_params = self._lv2_xgb_params()
+
         self.modes = list(args.modes)
         self.metrics = METRICS
         self.orig_metircs = [  # the original metrices as in the performance table
@@ -69,6 +72,7 @@ class Config(OrigConfig):
         super().setup_vars_and_paths(args)
         self.lv2_key = self.lv2_key or self._latest_lv2_key()
         self.lv2_res_dir = self.lv1_res_dir / self.lv2_key
+        self.lv2_mdl_dir = self.lv1_mdl_dir / self.lv2_key
 
         self.feat_tbl_path = {
             "targ-preds"  : self.lv2_res_dir / self.pred_out_path.name, 
@@ -95,6 +99,28 @@ class Config(OrigConfig):
         found = sorted( p.parent.name for p in self.lv1_res_dir.glob(f"{self.model_lv2}_{self.seed}_*/{self.pred_out_path.name}") )
         assert found, f"\nNo '{self.pred_out_path.name}' of a {self.model_lv2} / seed {self.seed} run under {self.lv1_res_dir}"
         return found[-1]
+
+    def _lv2_xgb_params(self) -> dict:
+        model_paths = sorted(self.lv2_mdl_dir.glob("pipeline_*.joblib"))
+        if len(model_paths) == 0:
+            return self.xgb_params
+
+        import joblib
+        keys = set(list(XGB_PARAM_SPACE.keys()) + list(self.xgb_params.keys()))
+        xgb_params = None
+
+        for path in model_paths:
+            model = joblib.load(path).named_steps["model"]
+            model = getattr(model, "regressor_", model)
+            all_params = model.get_params()
+            params = { k: all_params[k] for k in keys }
+            if xgb_params is not None and params != xgb_params:
+                print("\nMismatched XGBoost hyperparameters across folds. Refit them instead of reuse them")
+                return self.xgb_params
+            
+            xgb_params = params
+
+        return params
 
 
 class Lv2Data:
@@ -237,6 +263,7 @@ def evaluate_subset(blocks_selected: list[str], data: Lv2Data, config: Config, c
                 l1_ratios=config.l1_ratios,
                 alphas=config.alphas,
                 max_iter=config.max_iter, 
+                xgb_params=config.xgb_params, 
                 opt_trials=config.opt_trials, 
                 n_jobs=config.n_jobs,
                 verbose=config.verbose,
