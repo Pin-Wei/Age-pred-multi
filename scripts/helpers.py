@@ -534,9 +534,6 @@ def train_eval_model(
             if _dir_3:
                 os.makedirs(_dir_3, exist_ok=True)        
 
-    def _use_cached_model(model_path: str) -> bool:
-        return bool(model_path_template) and os.path.isfile(model_path) and not overwrite
-
     def _get_features(idx: np.ndarray) -> np.ndarray | pd.DataFrame:
         # The parameter X is read directly from the local variable
         return X.iloc[idx] if isinstance(X, pd.DataFrame) else X[idx]
@@ -640,17 +637,20 @@ def train_eval_model(
         custom_print(f"\nSearching the XGBoost hyperparameters over {opt_trials} trial(s) ...")
         study = optuna.create_study(direction="minimize", sampler=sampler)
         study.optimize(lambda trial: _eval_xgb_params(trial, idx), n_trials=opt_trials)
-        custom_print("\nParameter optimization is completed :-)")
+        custom_print("\nHyperparameter optimization is completed :-)")
         custom_print(f"Cross-validated MAE of the best trial: {study.best_value:.3f}")
+        custom_print("\nBest XGBoost hyperparameters = {")        
         for k, v in study.best_params.items():
             custom_print(f"\t{k}: {v}")
+        custom_print("}")
 
         return study.best_params
 
     def _fit_or_load(suffix: str, pipeline, idx: np.ndarray):
-        model_path = model_path_template.format(suffix) if model_path_template else None
+        model_path = model_path_template.format(suffix) if bool(model_path_template) else None
+        model_is_cached = bool(model_path) and os.path.isfile(model_path) and not overwrite
 
-        if _use_cached_model(model_path):
+        if model_is_cached:
             pipeline = joblib.load(model_path)            
             cached_targets = list(getattr(pipeline, "target_names_in_", []))
             assert cached_targets == targets, (
@@ -735,10 +735,10 @@ def train_eval_model(
     targets = Y.columns.to_list()
     n_targets = len(targets)
     y_arr = Y.to_numpy()
+    n_samples = len(y_arr)
 
     _validate_inputs()
 
-    n_samples = len(y_arr)
     y_pred = np.full((n_samples, n_targets), np.nan, dtype=np.float32)
     y_pred_ac = np.full_like(y_pred, np.nan) if apply_correction else None
     fold_n = np.full(n_samples, -1, dtype=np.int8)
@@ -749,17 +749,34 @@ def train_eval_model(
     if model_type == "xgboost":
         cuda_is_available = bool(XGBRegressor(tree_method="hist", device="cuda").fit([[0]], [0]))
         xgb_device = "cpu" if not cuda_is_available else xgb_device
-        
+
+        if len(xgb_params) > 0:
+            custom_print("\nFixed XGBoost hyperparameters = {")
+            for k, v in xgb_params.items():
+                custom_print(f"\t{k}: {v},")
+            custom_print("}")
+            
         skip_tune = False
         if not (XGB_PARAM_SPACE.keys() - xgb_params.keys()):
             custom_print("\n'xgb_params' fixes every tunable hyperparameter; no search is needed.\n")
             skip_tune = True
-        if (not skip_tune) and bool(model_path_template):
+
+        elif (not overwrite) and bool(model_path_template):
             suffixes = [ f"fold-{k}" for k in range(n_folds) ] if n_folds > 1 else [ "all" ]
-            model_paths = [ model_path_template.format(s) for s in suffixes ]
-            skip_tune = all( _use_cached_model(p) for p in model_paths )
-            if skip_tune:
-                custom_print("\nEvery model is already trained; the hyperparameter search is skipped.\n")
+            for s in suffixes:
+                model_path = model_path_template.format(s)
+                if os.path.isfile(model_path):
+                    custom_print("\nTrained model exists; the hyperparameter search is skipped.\n")
+                    skip_tune = True
+                    model = joblib.load(model_path).named_steps["model"]
+                    model = getattr(model, "regressor_", model)
+                    params = model.get_params()
+                    best_xgb_params = {
+                        k: params[k] for k in XGB_PARAM_SPACE.keys()
+                        if k not in xgb_params
+                    }
+                    break
+
         if not skip_tune:
             assert opt_trials > 0, "To perform hyperparameter tuning, `opt_trials` must be greater than zero."
             best_xgb_params = _optimize_xgb_params(idx_tr)
