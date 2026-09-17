@@ -2,7 +2,6 @@
 
 
 import argparse
-import json
 from pathlib import Path
 
 import pandas as pd
@@ -58,11 +57,12 @@ class Config(calc_corr.Config):
         self.corr_agg_s_path = self.agg_s_out_path  # aggregated correlation statistics over seeds per model x score
         self.corr_agg_m_path = self.agg_m_out_path  # aggregated correlation statistics over seeds per model
 
+        pad_name = "PAD" + (f"-{self.pad_type}" if self.pad_type != "raw" else "")
         self.age_scatter_templ = fig_out_dir_1 / "[scatter] Fits between real and predicted ages ({}).png"
         self.coef_bars_templ   = fig_out_dir_1 / "[bars] Coefficients of the fold-{} 2nd-level model ({}).png"
         self.mae_bars_path     = fig_out_dir_2 / f"[bars] MAE of 2nd-level models ({self.data_set}).png"
-        self.corr_boxes_path   = fig_out_dir_2 / f"[boxes] Correlations between PAD{self.pad_type} and {self.score_name} scores ({self.data_set}).png"
-        self.corr_heat_path    = fig_out_dir_2 / f"[heat] Correlations between PAD{self.pad_type} and {self.score_name} scores ({self.data_set}).png"
+        self.corr_boxes_path   = fig_out_dir_2 / f"[boxes] Correlations between {pad_name} and {self.score_name} scores ({self.data_set}).png"
+        self.corr_heat_path    = fig_out_dir_2 / f"[heat] Correlations between {pad_name} and {self.score_name} scores ({self.data_set}).png"
 
 
 def parse_args(argv: list[str] = None) -> argparse.Namespace:

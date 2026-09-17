@@ -177,23 +177,23 @@ def parse_args(argv: list[str] = None) -> argparse.Namespace:
 
     grp_data = parser.add_argument_group("data source")
     grp_data.add_argument("--feat_src", choices=FEAT_SRCS, default=FEAT_SRCS[0],
-                          help="which feature table feeds the second-level model")
+                          help="Which type of first-level outputs should be used as the input to the second-level model")
     grp_data.add_argument("--lv2_key", default=None,
                           help="Name of a second-level run folder, looked up under every first-level results folder; a glob pattern is accepted. None takes the most recent run")
 
     grp_search = parser.add_argument_group("search")
     grp_search.add_argument("--modes", nargs="+", choices=MODES, default=MODES, metavar="MODE",
-                            help=f"searches to run, in order; from {MODES}")
+                            help=f"Search modes to run, in order; from {MODES}")
     grp_search.add_argument("--score_by", choices=METRICS, default=f"Test_R2",
-                            help="metric that drives the stepwise choices and the importance deltas")
+                            help="Metric that drives the stepwise choices and the importance deltas")
 
     grp_refit = parser.add_argument_group("refitting")
     grp_refit.add_argument("--seeds", nargs="+", type=int, default=None, metavar="SEED",
-                           help="explicit seeds to refit each subset with; None draws --seed plus random ones")
+                           help="Explicit seeds to refit each subset with; None draws --seed plus random ones")
     grp_refit.add_argument("--n_seeds", type=int, default=5,
-                           help="number of seeds to draw when --seeds is not given")
+                           help="Number of seeds to draw when --seeds is not given")
     grp_refit.add_argument("--no_impute", dest="impute_data", action="store_false",
-                           help="do not impute missing feature values before fitting")
+                           help="Do not impute missing feature values before fitting")
 
     quieter = {"verbose": 0}  # every subset is refit once per seed; keep the fits quiet unless asked
     return orig_parse_args(argv, parser, quieter)

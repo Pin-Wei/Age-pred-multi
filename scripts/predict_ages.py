@@ -38,13 +38,13 @@ class Config:
         self.seed_inner = args.seed_inner
         self.max_iter = args.max_iter
         self.xgb_params = {
-            # "max_depth"       : 2,
-            # "learning_rate"   : 0.06,
-            # "n_estimators"    : 500,
-            # "min_child_weight": 8,
-            # "subsample"       : 0.7,
-            # "colsample_bytree": 0.5, 
-            "max_bin"         : 64
+            # "max_depth": , 
+            # "learning_rate": , 
+            # "n_estimators": , 
+            # "min_child_weight": , 
+            # "subsample": , 
+            # "colsample_bytree": , 
+            "max_bin": 64
         }
         self.opt_trials = args.opt_trials
         self.n_jobs = args.n_jobs
