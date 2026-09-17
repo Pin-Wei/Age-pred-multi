@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
 
-import os
 import json
+import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,38 @@ XGB_PARAM_SPACE = {
     "colsample_bytree": lambda t: t.suggest_float("colsample_bytree", 0.1, 1.0), 
     # "max_bin"         : lambda t: t.suggest_int("max_bin", 32, 128)
 }
+
+
+class TargetScaler(BaseEstimator, TransformerMixin):
+    '''
+    Scale multi-output targets relative to the first column.
+
+    Notes
+    -----
+    - NaNs are ignored when estimating mean and std, 
+      but are preserved in `transform` and `inverse_transform`.
+    - `y` argument exists only for API compatibility.
+    '''
+    def fit(self, X: np.ndarray, y: np.ndarray = None):
+        '''
+        Estimate per-column nan-aware mean 
+        and a scale derived from nan-aware standard deviations
+        (expressed in units of column 0's std). 
+        '''
+        X = np.asarray(X, dtype=np.float64)
+        std = np.nanstd(X, axis=0)
+        std[std == 0] = 1.  # prevent division by zero for constant column(s)
+
+        self.center_ = np.nanmean(X, axis=0)
+        self.scale_ = std / std[0]
+
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return (np.asarray(X, dtype=np.float64) - self.center_) / self.scale_
+
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        return np.asarray(X, dtype=np.float64) * self.scale_ + self.center_
 
 
 def print_missing(all_subjs: list[str], data_subjs: list[str]) -> list[str]:
@@ -809,34 +842,41 @@ def train_eval_model(
     )
 
 
-class TargetScaler(BaseEstimator, TransformerMixin):
+def get_latest_results(
+    result_dir: Path = None, 
+    search_level: str = "lv2", 
+    return_level: str = "dir", 
+    lv1_key: str = "*", 
+    lv2_key: str = "*", 
+    preds_fn: str | None = None, 
+    timestamp_pattern: str = r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$"
+) -> Path:
     '''
-    Scale multi-output targets relative to the first column.
-
-    Notes
-    -----
-    - NaNs are ignored when estimating mean and std, 
-      but are preserved in `transform` and `inverse_transform`.
-    - `y` argument exists only for API compatibility.
+    Find all second-level run or feature evaluation folders
+    that match a specific pattern and contain prediction table(s).
+    Than, return the one with the latest timestamp among the matches.
     '''
-    def fit(self, X: np.ndarray, y: np.ndarray = None):
-        '''
-        Estimate per-column nan-aware mean 
-        and a scale derived from nan-aware standard deviations
-        (expressed in units of column 0's std). 
-        '''
-        X = np.asarray(X, dtype=np.float64)
-        std = np.nanstd(X, axis=0)
-        std[std == 0] = 1.  # prevent division by zero for constant column(s)
+    if result_dir is None:
+        proj_root = Path(__file__).resolve().parents[1]
+        result_dir = proj_root / "results"
 
-        self.center_ = np.nanmean(X, axis=0)
-        self.scale_ = std / std[0]
+    if search_level == "lv2":
+        preds_fn = preds_fn or "predictions.csv"
+        pattern = os.path.join(lv1_key, lv2_key, preds_fn)
+    elif search_level == "eval":
+        preds_fn = preds_fn or "predictions_seed-*.csv"
+        pattern = os.path.join(lv1_key, lv2_key, "eval_*", preds_fn)
+    else:
+        raise ValueError(f"`search_level` can only be 'lv2' or 'eval', got '{search_level}'")
+    
+    found = sorted({ p.parent for p in result_dir.glob(pattern) })
+    assert found, f"\nNo {pattern} found under {result_dir}\n"
+    latest_dir = max(found, key=lambda p: re.findall(timestamp_pattern, p.name))
 
-        return self
-
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        return (np.asarray(X, dtype=np.float64) - self.center_) / self.scale_
-
-    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
-        return np.asarray(X, dtype=np.float64) * self.scale_ + self.center_
-
+    if return_level == "dir":
+        return latest_dir
+    elif return_level == "path":
+        return latest_dir / preds_fn
+    else:
+        raise ValueError(f"`return_level` can only be 'dir' or 'path', got '{return_level}'")
+    

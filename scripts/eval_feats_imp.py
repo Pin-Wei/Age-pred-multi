@@ -12,7 +12,7 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from helpers import XGB_PARAM_SPACE, train_eval_model
+from helpers import XGB_PARAM_SPACE, train_eval_model, get_latest_results
 from predict_ages import Config as OrigConfig
 from predict_ages import parse_args as orig_parse_args
 from predict_ages import SID, SET, AGE, COG, load_targets
@@ -40,8 +40,6 @@ class Config(OrigConfig):
     '''
     def __init__(self, args: argparse.Namespace = None):
         args = parse_args([]) if args is None else args
-        self.feat_src = args.feat_src
-        self.lv2_key = args.lv2_key
         super().__init__(args)
 
         if self.model_lv2 == "xgboost":
@@ -70,10 +68,13 @@ class Config(OrigConfig):
 
     def setup_vars_and_paths(self, args):
         super().setup_vars_and_paths(args)
-        self.lv2_key = self.lv2_key or self._latest_lv2_key()
-        self.lv2_res_dir = self.lv1_res_dir / self.lv2_key
-        self.lv2_mdl_dir = self.lv1_mdl_dir / self.lv2_key
+        self.lv2_res_dir = get_latest_results(search_level="lv2", lv2_key=args.lv2_key or "*")
+        self.lv2_key = self.lv2_res_dir.name
+        
+        lv1_key = self.lv2_res_dir.parent.name
+        self.lv2_mdl_dir = self.proj_root / "models" / lv1_key / self.lv2_key
 
+        self.feat_src = args.feat_src
         self.feat_tbl_path = {
             "targ-preds"  : self.lv2_res_dir / self.pred_out_path.name, 
             "cross-decomp": self.tbl_dir / "df_pls-feats.csv"
@@ -91,14 +92,6 @@ class Config(OrigConfig):
         self.pred_path_tmpl = out_dir / "predictions_seed-{}.csv"
         self.summ_path      = out_dir / "summary.json"
         self.log_path       = out_dir / "logs.txt"
-
-    def _latest_lv2_key(self):
-        '''
-        Name of the most recent second-level run folder holding predictions of this model / seed
-        '''
-        found = sorted( p.parent.name for p in self.lv1_res_dir.glob(f"{self.model_lv2}_{self.seed}_*/{self.pred_out_path.name}") )
-        assert found, f"\nNo '{self.pred_out_path.name}' of a {self.model_lv2} / seed {self.seed} run under {self.lv1_res_dir}"
-        return found[-1]
 
     def _lv2_xgb_params(self) -> dict:
         model_paths = sorted(self.lv2_mdl_dir.glob("pipeline_*.joblib"))
@@ -186,7 +179,7 @@ def parse_args(argv: list[str] = None) -> argparse.Namespace:
     grp_data.add_argument("--feat_src", choices=FEAT_SRCS, default=FEAT_SRCS[0],
                           help="which feature table feeds the second-level model")
     grp_data.add_argument("--lv2_key", default=None,
-                          help="second-level run folder under the first-level results dir; None picks the latest matching run")
+                          help="Name of a second-level run folder, looked up under every first-level results folder; a glob pattern is accepted. None takes the most recent run")
 
     grp_search = parser.add_argument_group("search")
     grp_search.add_argument("--modes", nargs="+", choices=MODES, default=MODES, metavar="MODE",

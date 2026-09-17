@@ -12,6 +12,7 @@ import pingouin as pg
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
 
+from helpers import get_latest_results
 from predict_ages import SID, SET, AGE
 from plotting import sig_stars
 
@@ -48,10 +49,10 @@ class Config:
         self.scores_df_path   = tbl_dir / f"df_scores_{self.score_name}.csv"
         self.scores_json_path = tbl_dir / "cog_scores.json"
 
-        self.eval_dir = Path(args.eval_dir) if args.eval_dir else self._latest_eval_dir()
-        # a folder that is not there and one that holds no tables fail differently: the
-        # first is a mistyped path (or an unset shell variable), the second a run that
-        # has not been evaluated yet
+        self.eval_dir = (
+            Path(args.eval_dir) if args.eval_dir 
+            else get_latest_results(search_level="eval")
+        )
         assert self.eval_dir.is_dir(), f"\nNo such folder: {self.eval_dir.resolve()}\n"
 
         self.preds_paths = sorted(self.eval_dir.glob("predictions_seed-*.csv"))
@@ -64,15 +65,6 @@ class Config:
         self.mae_summ_path  = self.out_dir / f"mae_{self.data_set}.csv"
         self.agg_s_out_path = self.out_dir / f"by-score_{self.data_set}_{self.fdr_scope}-{self.fdr_alpha}.csv"
         self.agg_m_out_path = self.out_dir / f"by-model_{self.data_set}_{self.fdr_scope}-{self.fdr_alpha}.csv"
-
-    def _latest_eval_dir(self) -> Path:
-        '''
-        Most recent feature-evaluation folder that carries prediction tables
-        '''
-        eval_preds_pattern = os.path.join("results", "*", "*", "eval_*", "predictions_seed-*.csv")
-        eval_dir_found = sorted(set( p.parent for p in self.proj_root.glob(eval_preds_pattern) ))
-        assert eval_dir_found, f"\nNo {eval_preds_pattern} found; pass --eval_dir\n"
-        return eval_dir_found[-1]
 
 
 def parse_args(

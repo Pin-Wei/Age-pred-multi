@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import joblib
 
+from helpers import get_latest_results
 from predict_ages import SID, SET, AGE
 
 
@@ -20,7 +21,10 @@ class Config:
     def __init__(self, args: argparse.Namespace):
         self.proj_root = Path(__file__).resolve().parents[1]
 
-        self.preds_path = Path(args.preds_path) if args.preds_path else self._latest_preds_path()
+        self.preds_path = (
+            Path(args.preds_path) if args.preds_path 
+            else get_latest_results(search_level="lv2", return_level="path")
+        )
         lv2_res_dir = self.preds_path.parent
         self.fits_out_path = lv2_res_dir / f"pred_fits.csv"
 
@@ -30,15 +34,6 @@ class Config:
         self.lv2_model_paths = sorted(lv2_mdl_dir.glob("pipeline_*.joblib"))
         assert self.lv2_model_paths, f"\nNo second-level model found. Did you change file name(s)?"
         self.coefs_out_path = lv2_res_dir / "coefficients.csv"
-
-    def _latest_preds_path(self) -> Path:
-        '''
-        Most recent second-level model's prediction table
-        '''
-        pattern = os.path.join("results", "*", "*", "predictions.csv")
-        found = sorted(self.proj_root.glob(pattern))
-        assert found, f"\nNo {pattern} found; pass --preds_path\n"
-        return found[-1]
 
 
 def parse_args(argv: list[str] = None) -> argparse.Namespace:
