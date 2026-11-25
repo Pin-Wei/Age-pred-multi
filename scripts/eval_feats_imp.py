@@ -15,12 +15,11 @@ import pandas as pd
 from helpers import get_latest_results
 from predict_ages import Config as OrigConfig
 from predict_ages import parse_args as orig_parse_args
-from predict_ages import SID, SET, AGE, COG, TARGETS, load_targets
+from predict_ages import SID, SET, AGE, COG, TARGETS, LV1_OUTPUTS, load_targets
 from training import XGB_PARAM_SPACE, train_eval_model
 from utils import mute_print, to_json_compatible, tee_output
 
 
-FEAT_SRCS = ["targ-preds", "cross-decomp"]
 ALL_MODES = ["only_one", "drop_one", "forward", "backward"]
 MODES = [ALL_MODES[0], ALL_MODES[1]]
 
@@ -101,16 +100,26 @@ class Config(OrigConfig):
                 self.targets = inferred_targets
                 self.target_key = target_prefix
 
-        self.feat_src = args.feat_src
-        self.feat_tbl_path = {
-            "targ-preds"  : self.lv2_res_dir / self.pred_out_path.name,
-            "cross-decomp": self.tbl_dir / "df_pls-feats.csv",
-        }[self.feat_src]
+        # Infer feat_src from folder tag (when --feat_src is omitted):
+        if args.feat_src is None:
+            self.feat_src = "cross-decomp" if "-comp" in self.model_lv1 else "targ-preds"
+        else:
+            self.feat_src = args.feat_src
+
+        if self.feat_src == "targ-preds":
+            self.feat_tbl_path = self.lv2_res_dir / self.pred_out_path.name
+        else:
+            candidates = [
+                self.lv2_res_dir / "pls_feats.csv",
+                lv1_res_dir / "pls_feats.csv",
+                self.tbl_dir / "df_pls-feats.csv",
+            ]
+            self.feat_tbl_path = next((c for c in candidates if c.is_file()), candidates[0])
 
         targ_alt = "|".join(re.escape(t) for t in self.targets)
         self.block_pattern = {
             "targ-preds"  : rf"^(?:{targ_alt})_(?!Final$)(?P<block>.+)$",  # 1 column per target per block
-            "cross-decomp": r"^(?P<block>.+)_PLS\d+$",  # k columns per block
+            "cross-decomp": rf"^(?:(?P<block>.+)_PLS\d+|(?:{targ_alt}|{AGE})_(?P<pyment>Pyment))$",  # k PLS cols + Pyment
         }[self.feat_src]
 
         out_dir = self.lv2_res_dir / f"eval_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
@@ -206,8 +215,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     grp_data = parser.add_argument_group("data source")
-    grp_data.add_argument("--feat_src", choices=FEAT_SRCS, default=FEAT_SRCS[0], 
-                          help="Which type of first-level outputs should be used as the input to the second-level model")
+    grp_data.add_argument("--feat_src", choices=LV1_OUTPUTS, default=None, 
+                          help="First-level output type used as input; None infers it from the selected run folder.")
     grp_data.add_argument("--lv2_key", default=None,
                           help="Name of a second-level run folder (glob pattern accepted). None takes the most recent run")
     grp_data.add_argument("--lv2_dir", default=None,
@@ -247,7 +256,10 @@ def load_lv2_data(config: Config) -> Lv2Data:
     for col in df.columns:
         matched = re.match(config.block_pattern, col)
         if matched:
-            blocks.setdefault(matched.group("block"), []).append(col)
+            groups = matched.groupdict()
+            block = groups.get("block") or groups.get("pyment")
+            if block:
+                blocks.setdefault(block, []).append(col)
 
     if not blocks:
         raise ValueError(f"No column of {config.feat_tbl_path.name} matches r'{config.block_pattern}'.")

@@ -129,6 +129,20 @@ def extract_pls_estimator(pipeline):
     return est
 
 
+def transform_pls_components(pipeline, X_sub) -> np.ndarray:
+    '''
+    Apply all preprocessing steps before `model`,
+    then project onto the fitted PLS latent components.
+    '''
+    X_t = X_sub
+    for _, step in pipeline.steps[:-1]:
+        X_t = step.transform(X_t)
+
+    pls = extract_pls_estimator(pipeline)
+
+    return np.asarray(pls.transform(X_t), dtype=np.float32)
+
+
 def select_pls_components_pa(
     X_tr: np.ndarray | pd.DataFrame,
     y_tr: np.ndarray,
@@ -246,20 +260,25 @@ def resolve_pls_components(
     pls_components: int | str | None,
     pls_max_components: int,
     pls_n_perm: int,
+    return_components: bool,
     n_folds: int,
     seed_inner: int,
+    n_jobs: int,
+    verbose: int,
     impute_data: bool,
     model_path_template: str | None,
     overwrite: bool,
 ) -> int | None:
     '''
-    Determine the PLS component count once on the training split when fixed
-    or selected by parallel analysis ("auto"). Returns None when each fold
-    should tune its own component count via inner CV.
+    Determine the PLS component count once on the training split when fixed,
+    selected by parallel analysis ("auto"), or required to be uniform across
+    outer folds (`return_components=True`). Returns None when each fold should
+    tune its own component count via inner CV.
     '''
     import joblib
 
     n_train, n_features = X_tr.shape
+    n_targets = y_tr_2d.shape[1]
     fold_tr_min = (n_train - int(np.ceil(n_train / n_folds))) if n_folds > 1 else n_train
     max_valid_k = max(1, min(fold_tr_min - 1, n_features))
 
@@ -294,7 +313,31 @@ def resolve_pls_components(
         )
 
     if pls_components in {None, "cv"}:
-        return None
+        if not return_components:
+            return None
+
+        cached_k = _find_cached_k()
+        if cached_k is not None:
+            custom_print(f"\nLoaded PLS component count ({cached_k}) from cached model.")
+            return cached_k
+
+        probe = build_pipeline(
+            "pls",
+            n_features,
+            n_targets,
+            seed_inner=seed_inner,
+            pls_n_components=None,
+            pls_max_components=min(pls_max_components, max_valid_k),
+            n_jobs=n_jobs,
+            verbose=verbose,
+            impute_data=impute_data,
+        )
+        y_fit = y_tr_2d if n_targets > 1 else y_tr_2d[:, 0]
+        probe.fit(X_tr, y_fit)
+        best_k = int(extract_pls_estimator(probe).n_components)
+        custom_print(f"\nInner CV selected {best_k} PLS component(s) for cross-decomp.")
+
+        return best_k
 
     raise ValueError(
         f"`pls_components` must be an int, 'auto', 'cv', or None; got {pls_components!r}."
@@ -311,6 +354,7 @@ def validate_inputs(
     xgb_device: str,
     n_folds: int,
     apply_correction: bool,
+    return_components: bool,
     model_path_template: str | None,
     model_perf_path: str | None,
     calib_param_path: str | None,
@@ -339,6 +383,13 @@ def validate_inputs(
 
     if model_type not in MODEL_TYPES:
         raise ValueError(f"Model type '{model_type}' is undefined.")
+    if return_components and model_type != "pls":
+        raise ValueError(f"`return_components=True` is only supported for model_type='pls', got '{model_type}'.")
+    if return_components and n_folds <= 1:
+        raise ValueError(
+            "`return_components=True` requires n_folds > 1 to produce out-of-fold components "
+            f"without target leakage, got n_folds={n_folds}."
+        )
     if perf_metric not in {"MAE", "R2"}:
         raise ValueError(f"Performance metric '{perf_metric}' is undefined.")
     if xgb_device not in {"cpu", "cuda"}:
@@ -700,6 +751,7 @@ def train_eval_model(
     pls_components: int | str | None = None,
     pls_max_components: int = DEFAULT_PLS_MAX_K,
     pls_n_perm: int = 100,
+    return_components: bool = False,
     n_jobs: int = -1,
     xgb_device: str = "cpu",
     verbose: int = 1,
@@ -710,11 +762,15 @@ def train_eval_model(
     model_perf_path: str | Path | None = None,
     calib_param_path: str | Path | None = None,
     overwrite: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame | None, np.ndarray]:
+) -> (
+    tuple[pd.DataFrame, pd.DataFrame | None, np.ndarray]
+    | tuple[pd.DataFrame, pd.DataFrame | None, np.ndarray, pd.DataFrame]
+):
     '''
     Fit one or more [optional imputer -> optional scaler -> regressor] pipeline(s)
     to produce train/test predictions, their age-corrected counterparts (optional),
-    and outer fold indices.
+    outer fold indices, and (when `return_components=True` for PLS) sign-aligned
+    out-of-fold / test latent components (`PLS1`, ..., `PLSK`).
     '''
     import joblib
     from sklearn.model_selection import KFold
@@ -745,6 +801,7 @@ def train_eval_model(
         xgb_device=xgb_device,
         n_folds=n_folds,
         apply_correction=apply_correction,
+        return_components=return_components,
         model_path_template=model_path_template,
         model_perf_path=model_perf_path,
         calib_param_path=calib_param_path,
@@ -763,8 +820,11 @@ def train_eval_model(
             pls_components=pls_components,
             pls_max_components=pls_max_components,
             pls_n_perm=pls_n_perm,
+            return_components=return_components,
             n_folds=n_folds,
             seed_inner=seed_inner,
+            n_jobs=n_jobs,
+            verbose=verbose,
             impute_data=impute_data,
             model_path_template=model_path_template,
             overwrite=overwrite,
@@ -849,6 +909,10 @@ def train_eval_model(
     y_pred = np.full((n_samples, n_targets), np.nan, dtype=np.float32)
     y_pred_ac = np.full_like(y_pred, np.nan) if apply_correction else None
     fold_n = np.full(n_samples, -1, dtype=np.int32)
+    comps_arr = np.full((n_samples, resolved_pls_k), np.nan, dtype=np.float32) if return_components else None
+    ref_x_weights: np.ndarray | None = None
+    best_sign_flips: np.ndarray | None = None
+    fold_abs_r: list[np.ndarray] = []
     perfs = []
     best_score = np.inf if perf_metric == "MAE" else -np.inf
 
@@ -885,6 +949,20 @@ def train_eval_model(
             y_pred[idx_tr[va]] = _predict(pipe_k, idx_tr[va])
             fold_n[idx_tr[va]] = k
 
+            sign_flips = None
+            if return_components:
+                W_k = extract_pls_estimator(pipe_k).x_weights_
+                if ref_x_weights is None:
+                    ref_x_weights = W_k.copy()
+                    sign_flips = np.ones(W_k.shape[1], dtype=np.float32)
+                else:
+                    dots = np.sum(ref_x_weights * W_k, axis=0)
+                    norms = np.linalg.norm(ref_x_weights, axis=0) * np.linalg.norm(W_k, axis=0)
+                    fold_abs_r.append(np.abs(dots) / np.where(norms > 0, norms, 1.0))
+                    sign_flips = np.where(dots < 0, -1.0, 1.0).astype(np.float32)
+
+                comps_arr[idx_tr[va]] = transform_pls_components(pipe_k, _get_features(idx_tr[va])) * sign_flips
+
             if apply_correction:
                 calibs[k] = fit_calibrator(y_arr[idx_tr[va]], y_pred[idx_tr[va]], targets)
                 y_pred_ac[idx_tr[va]] = apply_calibrator(y_pred[idx_tr[va]], calibs[k], targets)
@@ -900,11 +978,23 @@ def train_eval_model(
                 best_score = score
                 best_fold = k
                 best_pipe = pipe_k  # retain only the winning pipeline to save memory
+                best_sign_flips = sign_flips
 
             if model_perf_path:
                 perfs.append({"Split": f"Val_fold-{k}", "N": len(idx_tr[va]), **perf_va})
 
+        if return_components and fold_abs_r:
+            mean_abs_r = np.mean(fold_abs_r, axis=0)
+            min_abs_r = np.min(fold_abs_r, axis=0)
+            summary_str = ", ".join(
+                f"PLS{j + 1}={mean_abs_r[j]:.2f}(min {min_abs_r[j]:.2f})"
+                for j in range(len(mean_abs_r))
+            )
+            custom_print(f"\nCross-fold PLS weight |cos| vs fold-0: {summary_str}")
+
         y_pred[idx_te] = _predict(best_pipe, idx_te)
+        if return_components:
+            comps_arr[idx_te] = transform_pls_components(best_pipe, _get_features(idx_te)) * best_sign_flips
 
         if apply_correction:
             y_pred_ac[idx_te] = apply_calibrator(y_pred[idx_te], calibs[best_fold], targets)
@@ -949,5 +1039,9 @@ def train_eval_model(
 
     y_pred_df = pd.DataFrame(y_pred, columns=targets)
     y_pred_ac_df = pd.DataFrame(y_pred_ac, columns=targets) if apply_correction else None
+
+    if return_components:
+        comp_cols = [ f"PLS{j + 1}" for j in range(comps_arr.shape[1]) ]
+        return y_pred_df, y_pred_ac_df, fold_n, pd.DataFrame(comps_arr, columns=comp_cols)
 
     return y_pred_df, y_pred_ac_df, fold_n

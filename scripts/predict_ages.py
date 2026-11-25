@@ -20,6 +20,8 @@ from utils import custom_print, tee_output, to_json_compatible
 SID, SET, AGE, COG = "SID", "Set", "Age", "Cog"  # column names
 TARGETS = [[AGE], [AGE, COG]]
 TARGET_KEYS = ["1y", "2y"]  # prefix of the first-level folder, one per entry of TARGETS
+LV1_OUTPUTS = ["targ-preds", "cross-decomp"]  # output type of the first-level models; target(s) predicted values or the components derived from cross-decomposition
+DECOMP_MDL = "pls"  # the model (algorithm) used for cross-decomposition
 
 TBSS_MODALITIES = {"DTI_FA", "DTI_MD"}
 COGNITIVE_DOMAINS = ("LANGUAGE", "MEMORY", "MOTOR")
@@ -42,8 +44,21 @@ class Config:
         self.targets = TARGETS[args.targets]
         self.target_key = TARGET_KEYS[args.targets]
 
-        self.model_lv1 = args.model_lv1
-        self.pls_components = args.pls_components
+        self.lv1_output = args.lv1_output
+        self.decomp = self.lv1_output == "cross-decomp"
+        if self.decomp and (args.model_lv1 not in {DECOMP_MDL, MODEL_TYPES[0]}):
+            custom_print(
+                f"\n--model_lv1 {args.model_lv1} is ignored: "
+                f"the '{self.lv1_output}' route decomposes features with {DECOMP_MDL.upper()}.\n",
+                level="WARNING",
+            )
+
+        self.model_lv1 = DECOMP_MDL if self.decomp else args.model_lv1
+        self.pls_components = (
+            (DEFAULT_PLS_MAX_K if self.decomp else "cv")
+            if args.pls_components is None
+            else args.pls_components
+        )
         self.pls_max_components = args.pls_max_components
         self.pls_n_perm = args.pls_n_perm
 
@@ -76,9 +91,16 @@ class Config:
         self.cog_score_path  = self.tbl_dir / "cog_scores.json"
         self.pyment_tbl_path = self.proj_root / "data" / "pyment" / "predictions" / "predictions.csv"
 
-        if self.model_lv1 == "pls" and self.pls_components != "cv":
+        if self.decomp:
+            comp_tag = (
+                f"comp{self.pls_components}"
+                if isinstance(self.pls_components, int)
+                else f"comp-{self.pls_components}"
+            )
+            mdl_tag = f"{self.model_lv1}-{comp_tag}"  # holds no "_": downstream scripts split on "_"
+        elif self.model_lv1 == "pls" and self.pls_components != "cv":
             k_tag = f"k{self.pls_components}" if isinstance(self.pls_components, int) else str(self.pls_components)
-            mdl_tag = f"{self.model_lv1}-{k_tag}"  # holds no "_": downstream scripts split on "_"
+            mdl_tag = f"{self.model_lv1}-{k_tag}"
         else:
             mdl_tag = self.model_lv1
 
@@ -93,6 +115,7 @@ class Config:
         lv2_key = f"{self.model_lv2}_{self.seed}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         self.lv2_mdl_dir   = self.lv1_mdl_dir / lv2_key
         self.lv2_res_dir   = self.lv1_res_dir / lv2_key
+        self.pls_feat_path = self.lv2_res_dir / "pls_feats.csv"
         self.pred_out_path = self.lv2_res_dir / "predictions.csv"
         self.summ_out_path = self.lv2_res_dir / "summary.json"
         self.log_out_path  = self.lv2_res_dir / "logs.txt"
@@ -192,6 +215,10 @@ class Config:
         '''
         return {
             "targets"           : self.targets,
+            "lv1_output"        : self.lv1_output,
+            "pls_components"    : self.pls_components if self.decomp else None,
+            "pls_max_components": self.pls_max_components if self.decomp else None,
+            "pls_n_perm"        : self.pls_n_perm if (self.decomp and self.pls_components == "auto") else None,
             "model_lv1"         : self.model_lv1,
             "model_lv2"         : self.model_lv2,
             "n_folds"           : self.n_folds,
@@ -238,14 +265,18 @@ def parse_args(
     grp_model = parser.add_argument_group("model")
     grp_model.add_argument("--targets", type=int, choices=range(len(TARGETS)), default=1, 
                            help="Target(s) for models to predict. " + ", ".join(f"{i}: {x}" for i, x in enumerate(TARGETS)))
-    grp_model.add_argument("--pls_components", type=_parse_pls_components, default="cv", metavar="K|auto|cv", 
-                           help="PLS component selection: an integer K, 'auto' (OOF parallel analysis), or 'cv' (inner CV).")
+    grp_model.add_argument("--lv1_output", choices=LV1_OUTPUTS, default=LV1_OUTPUTS[0], 
+                           help=("What first-level models pass to level 2: 'targ-preds' (predicted targets) or "
+                                 f"'cross-decomp' ({DECOMP_MDL.upper()} latent components)."))
+    grp_model.add_argument("--pls_components", type=_parse_pls_components, default=None, metavar="K|auto|cv", 
+                           help=("PLS component selection: an integer K, 'auto' (OOF parallel analysis), or 'cv' (inner CV). "
+                                 f"None defaults to {DEFAULT_PLS_MAX_K} under 'cross-decomp' and 'cv' under 'targ-preds'."))
     grp_model.add_argument("--pls_max_components", type=int, default=DEFAULT_PLS_MAX_K, metavar="M",
                            help="Upper bound on PLS components when --pls_components is 'auto' or 'cv'.")
     grp_model.add_argument("--pls_n_perm", type=int, default=100, metavar="B",
                            help="Number of Y-permutations used by parallel analysis (--pls_components auto).")
     grp_model.add_argument("--model_lv1", choices=MODEL_TYPES, default=MODEL_TYPES[0],
-                           help="Regression algorithm for first-level models.")
+                           help="Regression algorithm for first-level models; ignored under '--lv1_output cross-decomp'.")
     grp_model.add_argument("--model_lv2", choices=MODEL_TYPES, default=MODEL_TYPES[2],
                            help="Regression algorithm for the second-level model.")
     grp_model.add_argument("--l1_ratios", nargs="+", type=float, default=L1_RATIOS, metavar="R",
@@ -412,18 +443,26 @@ def run_lv1_models(
         y = subj_df.loc[subj_list, config.targets].astype(np.float32)
         idx_tr, idx_te = split_indices(subj_df.loc[subj_list, SET])
 
-        custom_print(f"\nTrain and eval {config.model_lv1} models on {f_name} features ...")
-        y_pred, _, fold_n = train_eval_model(
+        verb = "Decompose" if config.decomp else "Train and eval"
+        custom_print(f"\n{verb} {config.model_lv1} models on {f_name} features ...")
+        outs = train_eval_model(
             X, y, idx_tr, idx_te,
             **lv1_kwargs,
+            return_components=config.decomp,
             impute_data=False,
             model_path_template=config.model_paths[f_name],
             model_perf_path=config.perf_paths[f_name],
         )
-        lv1_out = y_pred.add_suffix(f"_{f_name}")
+        y_pred, _, fold_n = outs[:3]
+        targ_preds = y_pred.add_suffix(f"_{f_name}")
+        # "{block}_PLS{k}" matches eval_feats_imp.py --feat_src cross-decomp
+        lv1_out = outs[3].add_prefix(f"{f_name}_") if config.decomp else targ_preds
         lv1_cols_by_feat[f_name] = lv1_out.columns.to_list()
 
-        parts = [pd.DataFrame({SID: subj_list, f"Fold_{f_name}": fold_n}), lv1_out]
+        parts = [pd.DataFrame({SID: subj_list, f"Fold_{f_name}": fold_n})]
+        if config.decomp:
+            parts.append(targ_preds)  # keep per-block target predictions alongside components
+        parts.append(lv1_out)
         pred_by_feat.append(pd.concat(parts, axis=1))
 
         summ_by_feat[f_name] = {
@@ -494,6 +533,15 @@ def add_pyment_results(
     return pred_out, summ_by_feat, lv1_cols_by_feat
 
 
+def save_pls_feats(pred_out: pd.DataFrame, lv1_cols: list[str], config: Config) -> None:
+    '''
+    Write PLS components inside `config.lv2_res_dir` so each run keeps its own copy.
+    '''
+    config.pls_feat_path.parent.mkdir(parents=True, exist_ok=True)
+    pred_out.loc[:, [SID] + lv1_cols].to_csv(config.pls_feat_path, index=False)
+    custom_print(f"\nSaved: {config.pls_feat_path}")
+
+
 def run_lv2_model(
     pred_out: pd.DataFrame,
     summ_by_feat: dict,
@@ -504,8 +552,9 @@ def run_lv2_model(
     idx_tr, idx_te = split_indices(pred_out[SET])
     apply_correction = config.n_folds > 1
 
+    kind = "component" if config.decomp else "prediction"
     custom_print(
-        f"\nTrain and eval the final {config.model_lv2} model on the {len(active_cols)} first-level prediction(s) ..."
+        f"\nTrain and eval the final {config.model_lv2} model on the {len(active_cols)} first-level {kind}(s) ..."
     )
     y_pred, y_pred_ac, _ = train_eval_model(
         X=pred_out.loc[:, active_cols].astype(np.float32),
@@ -554,6 +603,9 @@ def main(config: Config) -> None:
         pred_out, summ_by_feat, lv1_cols_by_feat, config
     )
     lv1_cols = [ col for cols in lv1_cols_by_feat.values() for col in cols ]
+
+    if config.decomp:
+        save_pls_feats(pred_out, lv1_cols, config)
 
     pred_out, summ_out = run_lv2_model(pred_out, summ_by_feat, lv1_cols, config)
 
