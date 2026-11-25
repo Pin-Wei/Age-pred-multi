@@ -1,6 +1,6 @@
 
 **/__pycache__/
-
+.claude/
 data/*
 etc/licenses/
 figures/
