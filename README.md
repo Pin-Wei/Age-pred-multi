@@ -2,21 +2,21 @@
 
 A two-level multimodal machine learning pipeline for predicting chronological age (`Age`), cognitive performance (`Cog`), or an equal-weight composite of both (`Mix`) from neuroimaging, electrophysiological, and behavioral features, followed by feature-block ablation, predicted age difference (PAD, predicted age − chronological age) correlation analysis, and publication-ready visualization.
 
-## Overview
+## 1. Overview
 
 The pipeline integrates multiple brain and behavioral modalities through a two-level stacking architecture:
 
-1. **Level 1 (Modality-Specific Models)**: Fits per-modality cross-validated models independently on each feature block (`DTI_FA`, `DTI_MD`, `rs-EEG_PSD`, `rs-MRI_FC`, `MRI_ROI`, `FUN_COGNITIVE`, `BEH_COGNITIVE`) and incorporates brain-age predictions from the pre-trained [Pyment](https://github.com/estenhl/pyment-public) 3-D CNN model. Level 1 supports two output routes (`--lv1_output`):
+- **Level 1 (Modality-Specific Models)**: Fits per-modality cross-validated models independently on each feature block (`DTI_FA`, `DTI_MD`, `rs-EEG_PSD`, `rs-MRI_FC`, `MRI_ROI`, `FUN_COGNITIVE`, `BEH_COGNITIVE`) and incorporates brain-age predictions from the pre-trained [Pyment](https://github.com/estenhl/pyment-public) 3-D CNN model. Level 1 supports two output routes (`--lv1_output`):
 
    * **`targ-preds`** *(default)*: Passes out-of-fold / test target predictions from each modality to Level 2.
 
    * **`cross-decomp`**: Projects each modality onto supervised PLS latent components (with fixed *K*, inner-CV selection, or cross-validated permutation Parallel Analysis `--pls_components auto`, sign-aligned across folds to fold 0).
 
-2. **Level 2 (Multimodal Stacking Model)**: Trains a cross-validated second-level regressor (meta-model, `--model_lv2`, with median imputation for missing modalities) on the merged Level-1 predictions or PLS components to produce the final multimodal predictions, applies Cole's linear age-bias correction per fold, and (for `Mix` targets) maps composite predictions back to `Age` and `Cog` scales.
+- **Level 2 (Multimodal Stacking Model)**: Trains a cross-validated second-level regressor (meta-model, `--model_lv2`, with median imputation for missing modalities) on the merged Level-1 predictions or PLS components to produce the final multimodal predictions, applies Cole's linear age-bias correction per fold, and (for `Mix` targets) maps composite predictions back to `Age` and `Cog` scales.
 
-3. **Downstream Evaluation**: Summarizes regression fits and Level-2 weights/importances (`summ_results.py`), evaluates modality importance via multi-seed ablation and stepwise selection (`eval_feats_imp.py`), computes Benjamini–Hochberg FDR-corrected PAD–cognition correlations (`calc_corr.py`), and generates publication-ready figures (`plot_results.py`).
+- **Downstream Evaluation**: Summarizes regression fits and Level-2 weights/importances (`summ_results.py`), evaluates modality importance via multi-seed ablation and stepwise selection (`eval_feats_imp.py`), computes Benjamini–Hochberg FDR-corrected PAD–cognition correlations (`calc_corr.py`), and generates publication-ready figures (`plot_results.py`).
 
-## Repository Structure
+## 2. Repository Structure
 
 ```
 Age-pred-multi/
@@ -50,7 +50,7 @@ Age-pred-multi/
 
 Runtime directories (`data/`, `models/`, `results/`, and `figures/`) are untracked by git. All scripts resolve paths from their own location (`scripts/..` is the project root), so they can be run from any working directory.
 
-## Installation
+## 3. Installation
 
 Create the Conda environment from `environment.yml`:
 
@@ -72,9 +72,9 @@ conda activate age_pred
 
 * `run_tbss.sh` requires FSL (`$FSLDIR`), and `run_pyment.sh` requires Docker with GPU support (Dockerfiles and config are in `etc/`).
 
-## Supported Modalities, Targets & Models
+## 4. Supported Modalities, Targets & Models
 
-### Feature Blocks
+### 4.1. Feature Blocks
 
 | Block | Description | Source |
 | ----- | ----- | ----- |
@@ -88,7 +88,7 @@ conda activate age_pred
 
 Participants missing data for a block are omitted from that Level-1 model, and the resulting gaps are median-imputed at Level 2. `--feat_types` restricts Level 1 to specified blocks (`Pyment` is always added at Level 2).
 
-### Targets (`--targets`)
+### 4.2. Targets (`--targets`)
 
 | Value | Target(s) | Description | 
 | ----- | ----- | ----- | 
@@ -98,7 +98,7 @@ Participants missing data for a block are omitted from that Level-1 model, and t
 
 Under `--targets 2`, every `Mix` prediction is mapped back to `Age` and `Cog` via training-set least-squares fits (`restore_from_mix`), so downstream scripts always find `Age_*` and `Cog_*` columns (the `Age` fit is the identity under `--mix_in_years`).
 
-### Regression Algorithms (`--model_lv1` / `--model_lv2`)
+### 4.3. Regression Algorithms (`--model_lv1` / `--model_lv2`)
 
 | Key | Model | Hyperparameter Tuning & Scaling | 
 | ----- | ----- | ----- | 
@@ -112,9 +112,9 @@ Under `--targets 2`, every `Mix` prediction is mapped back to `Age` and `Cog` vi
 
 Features are standardized within each training fold (except for `xgboost`), and inner CV uses 5 folds with `--seed_inner`.
 
-## Usage
+## 5. Usage
 
-### 1. Data Preparation (one-time)
+### 5.1. Data Preparation (one-time)
 
 Download raw recordings and build tabular features, cognitive scores, TBSS volumes, and Pyment predictions:
 
@@ -128,7 +128,7 @@ python scripts/make_df_rs-fmri_fc.py
 python scripts/make_df_scores.py            # required whenever Cog or Mix is a target
 ```
 
-### 2. Two-Level Training & Prediction (`predict_ages.py`)
+### 5.2. Two-Level Training & Prediction (`predict_ages.py`)
 
 Splits the training set into `--n_folds` outer folds (`--seed`): training predictions are out-of-fold, test predictions come from the fold with the lowest validation MAE, and Level 2 is trained on these out-of-fold outputs with per-fold Cole age-bias correction (`C-*`). Existing `.joblib` models are reused unless `--overwrite_mdl` or `--add_new_mdls` is passed.
 
@@ -154,7 +154,7 @@ python scripts/predict_ages.py --lv1_output cross-decomp --pls_components auto -
 python scripts/predict_ages.py --only_run_lv1_models --feat_types DTI_FA DTI_MD
 ```
 
-### 3. Fit & Coefficient Summaries (`summ_results.py`)
+### 5.3. Fit & Coefficient Summaries (`summ_results.py`)
 
 Computes per-split (`all`, `test`, `train`) linear regression fits, correlations, MAE, and $R^2$ (`pred_fits.csv`), and extracts Level-2 linear coefficients or tree feature importances across folds (`coefficients.csv`):
 
@@ -166,7 +166,7 @@ python scripts/summ_results.py
 python scripts/summ_results.py -p results/<lv1_key>/<lv2_key>/predictions.csv
 ```
 
-### 4. Feature-Block Importance & Ablation (`eval_feats_imp.py`)
+### 5.4. Feature-Block Importance & Ablation (`eval_feats_imp.py`)
 
 Groups Level-2 input columns into modality blocks (plus `Pyment`) and refits Level 2 on subsets (`--modes`: `only_one`, `drop_one`, `forward`, `backward`, ranked by `--score_by`, default `Test_R2`) across `--n_seeds` (default `5`) reproducible seeds. Automatically infers `targets`, `mix_in_years`, `ALPHAS_LOWER` (for z-scored `Mix`), and `feat_src` (`targ-preds` vs `cross-decomp`) from the selected run folder name, and reuses saved Level-2 XGBoost hyperparameters. Note that custom `--alphas` grids are not read back from saved runs and should be passed explicitly if used.
 
@@ -178,7 +178,7 @@ python scripts/eval_feats_imp.py --n_seeds 5
 python scripts/eval_feats_imp.py --lv2_dir results/<lv1_key>/<lv2_key> --modes only_one drop_one forward backward
 ```
 
-### 5. PAD × Cognitive Score Correlations (`calc_corr.py`)
+### 5.5. PAD × Cognitive Score Correlations (`calc_corr.py`)
 
 Correlates PAD from every model in `predictions_seed-*.csv` with every score in `df_scores_ST.csv` that was not used to build `Cog`. Supports `-pad` (`0` age-corrected `C-*`, `1` raw with age partialled out of PAD *\[default\]*, `2` raw), `-ps` (also partial age out of the scores), `-m` (`0` Pearson, `1` Spearman), and `-set` (`0` all, `1` test, `2` train). Averages correlations across seeds via Fisher's *z*, applies Benjamini–Hochberg FDR (`-fdr`, default `0.05`; `-fs 0` across all models or `-fs 1` per model), and tests per-model displacement from zero via Wilcoxon signed-rank tests:
 
@@ -190,7 +190,7 @@ python scripts/calc_corr.py
 python scripts/calc_corr.py -d results/<lv1_key>/<lv2_key>/eval_<timestamp> -pad 1 -m 0 -fdr 0.05
 ```
 
-### 6. Visualization (`plot_results.py`)
+### 5.6. Visualization (`plot_results.py`)
 
 Generates scatter plots, Level-2 block weight/importance bars, ablation MAE bars, correlation boxplots, and correlation heatmaps (`--fig_scale`, `--font_scale`, `--dpi`). Because `plot_results.py` locates the Level-2 run via `eval_<timestamp>/`, `--to_draw 1 2` requires `summ_results.py` and `eval_feats_imp.py` to have run, while `--to_draw 3 4 5` also requires `calc_corr.py`:
 
@@ -222,7 +222,7 @@ python scripts/calc_corr.py -d $LV2/eval_<timestamp>
 python scripts/plot_results.py -d $LV2/eval_<timestamp>
 ```
 
-## Output Directory Layout
+## 6. Output Directory Layout
 
 Results, saved pipelines (`models/`), and figures (`figures/`) share a mirrored hierarchy:
 
@@ -254,7 +254,7 @@ results/<lv1_key>/
 
 * `mdl_tag` never contains underscores (`_`), as downstream scripts split `lv1_key` on `_`. `--add_new_mdls` appends `+` until an unused folder name is found.
 
-## Notes on Interpretation
+## 7. Notes on Interpretation
 
 * **Composite-target PAD circularity**: Under `--targets 2`, PAD contains `SD(Age) × [ ±z(Cog) − z(Age) ] / 2` by construction (i.e. `−SD(Age) × [ z(Age) + z(Cog) ] / 2` when `Age` and `Cog` are negatively correlated), regardless of whether `--mix_in_years` is set. A correlation between this PAD and cognitive scores is therefore not by itself evidence that brain features carry cognitive signal.
 
