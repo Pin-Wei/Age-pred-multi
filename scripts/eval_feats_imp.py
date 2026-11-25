@@ -12,10 +12,11 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from helpers import XGB_PARAM_SPACE, train_eval_model, get_latest_results
+from helpers import get_latest_results
 from predict_ages import Config as OrigConfig
 from predict_ages import parse_args as orig_parse_args
 from predict_ages import SID, SET, AGE, COG, load_targets
+from training import XGB_PARAM_SPACE, train_eval_model
 from utils import mute_print, to_json_compatible, tee_output
 
 
