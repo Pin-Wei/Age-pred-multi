@@ -11,7 +11,7 @@ import pandas as pd
 
 from helpers import get_tbss_processed, load_feat_table, print_missing
 from training import (
-    MODEL_TYPES, L1_RATIOS, ALPHAS,
+    MODEL_TYPES, L1_RATIOS, ALPHAS, DEFAULT_PLS_MAX_K,
     calc_metrics, train_eval_model,
 )
 from utils import custom_print, tee_output, to_json_compatible
@@ -43,6 +43,10 @@ class Config:
         self.target_key = TARGET_KEYS[args.targets]
 
         self.model_lv1 = args.model_lv1
+        self.pls_components = args.pls_components
+        self.pls_max_components = args.pls_max_components
+        self.pls_n_perm = args.pls_n_perm
+
         self.model_lv2 = args.model_lv2
         self.l1_ratios = list(args.l1_ratios)
         self.alphas = list(args.alphas)
@@ -72,7 +76,13 @@ class Config:
         self.cog_score_path  = self.tbl_dir / "cog_scores.json"
         self.pyment_tbl_path = self.proj_root / "data" / "pyment" / "predictions" / "predictions.csv"
 
-        lv1_key = f"{self.target_key}_{self.model_lv1}_cv{self.n_folds}_{self.seed}"
+        if self.model_lv1 == "pls" and self.pls_components != "cv":
+            k_tag = f"k{self.pls_components}" if isinstance(self.pls_components, int) else str(self.pls_components)
+            mdl_tag = f"{self.model_lv1}-{k_tag}"  # holds no "_": downstream scripts split on "_"
+        else:
+            mdl_tag = self.model_lv1
+
+        lv1_key = f"{self.target_key}_{mdl_tag}_cv{self.n_folds}_{self.seed}"
         if args.add_new_mdls:
             while (self.proj_root / "models" / lv1_key).is_dir() or (self.proj_root / "results" / lv1_key).is_dir():
                 lv1_key += "+"
@@ -167,6 +177,9 @@ class Config:
             "max_iter"          : self.max_iter,
             "xgb_params"        : self.xgb_params,
             "opt_trials"        : self.opt_trials,
+            "pls_components"    : self.pls_components if model_type == "pls" else None,
+            "pls_max_components": self.pls_max_components,
+            "pls_n_perm"        : self.pls_n_perm,
             "n_jobs"            : self.n_jobs,
             "xgb_device"        : self.xgb_device,
             "verbose"           : self.verbose,
@@ -198,6 +211,23 @@ def parse_args(
     '''
     Command-line overrides for the Config values worth varying between runs.
     '''
+    def _parse_pls_components(val: str) -> int | str:
+        low = val.strip().lower()
+        if low in {"auto", "cv"}:
+            return low
+
+        try:
+            k = int(val)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"--pls_components must be a positive integer, 'auto', or 'cv'; got {val!r}."
+            ) from exc
+
+        if k < 1:
+            raise argparse.ArgumentTypeError(f"--pls_components must be >= 1; got {k}.")
+
+        return k
+
     parser = parser or argparse.ArgumentParser(
         description="Train and evaluate the two-level age-prediction pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -208,6 +238,12 @@ def parse_args(
     grp_model = parser.add_argument_group("model")
     grp_model.add_argument("--targets", type=int, choices=range(len(TARGETS)), default=1, 
                            help="Target(s) for models to predict. " + ", ".join(f"{i}: {x}" for i, x in enumerate(TARGETS)))
+    grp_model.add_argument("--pls_components", type=_parse_pls_components, default="cv", metavar="K|auto|cv", 
+                           help="PLS component selection: an integer K, 'auto' (OOF parallel analysis), or 'cv' (inner CV).")
+    grp_model.add_argument("--pls_max_components", type=int, default=DEFAULT_PLS_MAX_K, metavar="M",
+                           help="Upper bound on PLS components when --pls_components is 'auto' or 'cv'.")
+    grp_model.add_argument("--pls_n_perm", type=int, default=100, metavar="B",
+                           help="Number of Y-permutations used by parallel analysis (--pls_components auto).")
     grp_model.add_argument("--model_lv1", choices=MODEL_TYPES, default=MODEL_TYPES[0],
                            help="Regression algorithm for first-level models.")
     grp_model.add_argument("--model_lv2", choices=MODEL_TYPES, default=MODEL_TYPES[2],
@@ -225,7 +261,7 @@ def parse_args(
     grp_model.add_argument("--seed", type=int, default=42,
                            help="Random seed for the outer cross-validation splits.")
     grp_model.add_argument("--seed_inner", type=int, default=0,
-                           help="Random seed for hyperparameter tuning.")
+                           help="Random seed for hyperparameter tuning / parallel analysis.")
 
     grp_data = parser.add_argument_group("data")
     grp_data.add_argument("--feat_types", nargs="+", default=None, metavar="FEAT",

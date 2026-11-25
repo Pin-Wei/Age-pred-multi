@@ -10,7 +10,7 @@ import pandas as pd
 from utils import custom_print
 
 
-MODEL_TYPES = ["elasticnet", "lasso", "ridge", "xgboost"]
+MODEL_TYPES = ["elasticnet", "lasso", "ridge", "xgboost", "msvr", "mogp", "pls"]
 L1_RATIOS = [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
 ALPHAS = [1e-1, 1.0, 3.0, 1e1, 3e1, 1e2, 3e2, 1e3, 1e4, 1e5]
 XGB_PARAM_SPACE = {
@@ -22,6 +22,12 @@ XGB_PARAM_SPACE = {
     "colsample_bytree": lambda t: t.suggest_float("colsample_bytree", 0.1, 1.0),
     # "max_bin"         : lambda t: t.suggest_int("max_bin", 32, 128),
 }
+MSVR_GRID = {
+    "C"      : [1e-1, 1e0, 1e1, 1e2],
+    "epsilon": [0.1, 0.5],
+    "gamma"  : [0.1, 1.0, 10.0],
+}
+DEFAULT_PLS_MAX_K = 20
 
 
 def calc_metrics(
@@ -110,6 +116,189 @@ def xgb_cuda_available() -> bool:
 
     except Exception:
         return False
+
+
+def extract_pls_estimator(pipeline):
+    '''
+    Unwrap Pipeline -> [TransformedTargetRegressor] -> [GridSearchCV] -> PLSRegression.
+    '''
+    est = pipeline.named_steps["model"]
+    est = getattr(est, "regressor_", est)
+    est = getattr(est, "best_estimator_", est)
+
+    return est
+
+
+def select_pls_components_pa(
+    X_tr: np.ndarray | pd.DataFrame,
+    y_tr: np.ndarray,
+    max_components: int = DEFAULT_PLS_MAX_K,
+    n_perm: int = 100,
+    percentile: float = 95.0,
+    cv_splits: int = 5,
+    random_state: int = 0,
+    impute_data: bool = False,
+) -> int:
+    '''
+    Select the number of supervised PLS components 
+    via cross-validated permutation Parallel Analysis.
+
+    Using out-of-fold incremental R^2 (instead of in-sample Y-variance) avoids
+    high-dimensional (p >> n) overfitting inflation in the permuted null distribution.
+    A thin SVD row-space projection is applied when `p > n` so every CV fit runs
+    in O(n^2 * k) with mathematically identical PLS scores and predictions.
+    '''
+    from sklearn.cross_decomposition import PLSRegression
+    from sklearn.impute import SimpleImputer
+    from sklearn.model_selection import KFold
+    from sklearn.preprocessing import StandardScaler
+
+    X_arr = np.asarray(X_tr, dtype=np.float64)
+    if impute_data:
+        X_arr = SimpleImputer(strategy="median").fit_transform(X_arr)
+    X_arr = StandardScaler().fit_transform(X_arr)
+
+    Y_arr = np.asarray(y_tr, dtype=np.float64).reshape(len(X_arr), -1)
+    Y_arr = StandardScaler().fit_transform(Y_arr)
+
+    n_samples, n_features = X_arr.shape
+    fold_tr_min = n_samples - int(np.ceil(n_samples / cv_splits))
+    k_max = int(min(max_components, fold_tr_min - 1, n_features))
+    if k_max <= 1:
+        return 1
+
+    # Row-space reduction when p > n: Z @ Z.T == X @ X.T, preserving exact NIPALS PLS scores
+    if n_features > n_samples:
+        U, s, _ = np.linalg.svd(X_arr, full_matrices=False)
+        Z = U * s
+    else:
+        Z = X_arr
+
+    folds = list(KFold(n_splits=cv_splits, shuffle=True, random_state=random_state).split(Z))
+
+    def _oof_delta_r2(Y_mat: np.ndarray) -> np.ndarray:
+        oof_preds = np.empty((k_max, n_samples, Y_mat.shape[1]), dtype=np.float64)
+        for tr, va in folds:
+            Z_tr, Z_va = Z[tr], Z[va]
+            Y_fold_tr = Y_mat[tr]
+            pls = PLSRegression(n_components=k_max, scale=False)
+            pls.fit(Z_tr, Y_fold_tr)
+
+            T_va = (Z_va - pls._x_mean) @ pls.x_rotations_  # (n_va, k_max)
+            Q = pls.y_loadings_                              # (q, k_max)
+            cum_pred = np.broadcast_to(pls._y_mean, (len(va), Y_mat.shape[1])).copy()
+            for k in range(k_max):
+                cum_pred = cum_pred + np.outer(T_va[:, k], Q[:, k])
+                oof_preds[k, va] = cum_pred
+
+        total_ss = float(np.sum((Y_mat - Y_mat.mean(axis=0)) ** 2))
+        if total_ss <= 0:
+            return np.zeros(k_max, dtype=np.float64)
+
+        cum_r2 = np.array([
+            1.0 - float(np.sum((Y_mat - oof_preds[k]) ** 2)) / total_ss
+            for k in range(k_max)
+        ])
+        prev_r2 = np.concatenate(([0.0], cum_r2[:-1]))
+
+        return cum_r2 - prev_r2
+
+    obs_delta = _oof_delta_r2(Y_arr)
+    rng = np.random.default_rng(random_state)
+    null_delta = np.empty((n_perm, k_max), dtype=np.float64)
+    for b in range(n_perm):
+        perm_idx = rng.permutation(n_samples)
+        null_delta[b] = _oof_delta_r2(Y_arr[perm_idx])
+
+    thresh = np.percentile(null_delta, percentile, axis=0)
+    above = (obs_delta > thresh) & (obs_delta > 0.0)
+
+    # Keep the longest leading prefix above both 0 and the permutation threshold
+    n_selected = 0
+    for is_sig in above:
+        if is_sig:
+            n_selected += 1
+        else:
+            break
+
+    if n_selected == 0:
+        custom_print(
+            f"OOF parallel analysis found no PLS component above the {percentile:.0f}th permutation percentile; "
+            "falling back to 1 component.",
+            level="WARNING",
+        )
+        n_selected = 1
+    else:
+        custom_print(
+            f"OOF parallel analysis ({n_perm} permutations, {percentile:.0f}th pct) selected "
+            f"{n_selected} / {k_max} PLS component(s) "
+            f"(OOF R^2 = {obs_delta[:n_selected].sum():.3f}; "
+            f"last dR^2 = {obs_delta[n_selected - 1]:.4f} vs thr {thresh[n_selected - 1]:.4f})."
+        )
+
+    return n_selected
+
+
+def resolve_pls_components(
+    X_tr: np.ndarray | pd.DataFrame,
+    y_tr_2d: np.ndarray,
+    *,
+    pls_components: int | str | None,
+    pls_max_components: int,
+    pls_n_perm: int,
+    n_folds: int,
+    seed_inner: int,
+    impute_data: bool,
+    model_path_template: str | None,
+    overwrite: bool,
+) -> int | None:
+    '''
+    Determine the PLS component count once on the training split when fixed
+    or selected by parallel analysis ("auto"). Returns None when each fold
+    should tune its own component count via inner CV.
+    '''
+    import joblib
+
+    n_train, n_features = X_tr.shape
+    fold_tr_min = (n_train - int(np.ceil(n_train / n_folds))) if n_folds > 1 else n_train
+    max_valid_k = max(1, min(fold_tr_min - 1, n_features))
+
+    def _find_cached_k() -> int | None:
+        if overwrite or not model_path_template:
+            return None
+        suffixes = [ f"fold-{k}" for k in range(n_folds) ] if n_folds > 1 else ["all"]
+        for s in suffixes:
+            mp = model_path_template.format(s)
+            if os.path.isfile(mp):
+                return int(extract_pls_estimator(joblib.load(mp)).n_components)
+        return None
+
+    if isinstance(pls_components, int):
+        if pls_components < 1:
+            raise ValueError(f"`pls_components` must be >= 1, got {pls_components}.")
+        return min(pls_components, max_valid_k)
+
+    if pls_components == "auto":
+        cached_k = _find_cached_k()
+        if cached_k is not None:
+            custom_print(f"\nLoaded PLS component count ({cached_k}) from cached model.")
+            return cached_k
+
+        return select_pls_components_pa(
+            X_tr,
+            y_tr_2d,
+            max_components=min(pls_max_components, max_valid_k),
+            n_perm=pls_n_perm,
+            random_state=seed_inner,
+            impute_data=impute_data,
+        )
+
+    if pls_components in {None, "cv"}:
+        return None
+
+    raise ValueError(
+        f"`pls_components` must be an int, 'auto', 'cv', or None; got {pls_components!r}."
+    )
 
 
 def validate_inputs(
@@ -206,6 +395,8 @@ def build_pipeline(
     alphas: list[float] | None = None,
     max_iter: int = 10000,
     xgb_params: dict | None = None,
+    pls_n_components: int | None = None,
+    pls_max_components: int = DEFAULT_PLS_MAX_K,
     device: str = "cpu",
     n_jobs: int = -1,
     verbose: int = 1,
@@ -213,8 +404,11 @@ def build_pipeline(
 ):
     '''
     Construct the [optional imputer -> optional scaler -> regressor] sklearn Pipeline.
+    Custom estimators from `models.py` are imported lazily
+    to avoid loading PyTorch/GPyTorch unless actually needed.
     '''
     from sklearn.compose import TransformedTargetRegressor
+    from sklearn.cross_decomposition import PLSRegression
     from sklearn.impute import SimpleImputer
     from sklearn.linear_model import (
         ElasticNetCV,
@@ -223,7 +417,7 @@ def build_pipeline(
         MultiTaskLassoCV,
         RidgeCV,
     )
-    from sklearn.model_selection import KFold
+    from sklearn.model_selection import GridSearchCV, KFold
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
@@ -232,6 +426,16 @@ def build_pipeline(
     l1_ratios = list(L1_RATIOS) if l1_ratios is None else list(l1_ratios)
     alphas = list(ALPHAS) if alphas is None else list(alphas)
     xgb_params = {} if xgb_params is None else dict(xgb_params)
+
+    def _grid_search(estimator, grid: dict):
+        return GridSearchCV(
+            estimator,
+            grid,
+            scoring="neg_mean_absolute_error",
+            cv=kf_inner,
+            n_jobs=n_jobs,
+            verbose=verbose,
+        )
 
     if model_type == "elasticnet":
         regressor = (MultiTaskElasticNetCV if multi else ElasticNetCV)(
@@ -265,10 +469,35 @@ def build_pipeline(
             n_jobs=n_jobs,
             verbosity=verbose,
         )
+    elif model_type == "msvr":
+        from models import MSVR
+        regressor = _grid_search(
+            MSVR(),
+            {**MSVR_GRID, "gamma": [ g / n_features for g in MSVR_GRID["gamma"] ]},
+        )
+    elif model_type == "mogp":
+        from models import MOGP
+        regressor = MOGP(
+            random_state=seed_inner,
+        )
+    elif model_type == "pls":
+        if pls_n_components is not None:
+            k_fixed = int(min(pls_n_components, n_features))
+            regressor = PLSRegression(n_components=max(1, k_fixed))
+        else:
+            max_k = min(pls_max_components, n_features)
+            regressor = _grid_search(
+                PLSRegression(),
+                {"n_components": list(range(1, max(2, max_k + 1)))},
+            )
     else:
         raise ValueError(f"Model type '{model_type}' is undefined.")
 
-    if multi:
+    if model_type in {"msvr", "mogp"}:  # sensitive to target scale
+        regressor = TransformedTargetRegressor(
+            regressor=regressor, transformer=StandardScaler()
+        )
+    elif multi:
         from models import TargetScaler
         regressor = TransformedTargetRegressor(
             regressor=regressor, transformer=TargetScaler()
@@ -468,6 +697,9 @@ def train_eval_model(
     max_iter: int = 10000,
     xgb_params: dict | None = None,
     opt_trials: int = 100,
+    pls_components: int | str | None = None,
+    pls_max_components: int = DEFAULT_PLS_MAX_K,
+    pls_n_perm: int = 100,
     n_jobs: int = -1,
     xgb_device: str = "cpu",
     verbose: int = 1,
@@ -524,6 +756,23 @@ def train_eval_model(
     def _get_targets(idx: np.ndarray) -> np.ndarray:
         return y_arr[idx] if n_targets > 1 else y_arr[idx, 0]
 
+    resolved_pls_k = (
+        resolve_pls_components(
+            _get_features(idx_tr),
+            y_arr[idx_tr],
+            pls_components=pls_components,
+            pls_max_components=pls_max_components,
+            pls_n_perm=pls_n_perm,
+            n_folds=n_folds,
+            seed_inner=seed_inner,
+            impute_data=impute_data,
+            model_path_template=model_path_template,
+            overwrite=overwrite,
+        )
+        if model_type == "pls"
+        else None
+    )
+
     def _make_pipe(device: str | None = None):
         # Resolve `xgb_device` at call time so CUDA->CPU fallback takes effect
         resolved_device = xgb_device if device is None else device
@@ -537,6 +786,8 @@ def train_eval_model(
             alphas=alphas,
             max_iter=max_iter,
             xgb_params={**xgb_params, **best_xgb_params},
+            pls_n_components=resolved_pls_k,
+            pls_max_components=pls_max_components,
             device=resolved_device,
             n_jobs=n_jobs,
             verbose=verbose,
@@ -555,6 +806,13 @@ def train_eval_model(
                     f"{os.path.basename(model_path)} was fit on {cached_targets or 'unrecorded target(s)'}, "
                     f"not on {targets}. Refit it by setting 'overwrite' to True."
                 )
+            if model_type == "pls" and resolved_pls_k is not None:
+                cached_k = int(extract_pls_estimator(pipeline).n_components)
+                if cached_k != resolved_pls_k:
+                    raise ValueError(
+                        f"{os.path.basename(model_path)} was fit with {cached_k} PLS component(s), "
+                        f"not {resolved_pls_k}. Refit it by setting 'overwrite' to True."
+                    )
             custom_print(f"Loaded pre-trained: {model_path}")
             return pipeline
 

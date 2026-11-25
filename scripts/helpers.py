@@ -337,10 +337,10 @@ def get_latest_results(
 
 def __getattr__(name: str):
     '''
-    Models saved before `TargetScaler` moved to `models.py` were pickled
-    under this module's name; resolve it lazily so they still load.
+    Models saved before `TargetScaler`, `MSVR`, and `MOGP` moved to `models.py`
+    were pickled under this module's name; resolve them lazily so they still load.
     '''
-    if name in {"TargetScaler"}:
+    if name in {"TargetScaler", "MSVR", "MOGP"}:
         import models
         return getattr(models, name)
 
