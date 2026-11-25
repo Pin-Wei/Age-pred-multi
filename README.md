@@ -24,24 +24,24 @@ Age-pred-multi/
 │   ├── pyment_config.json
 │   ├── pyment_preprocess.Dockerfile
 │   └── pyment_preprocess_and_finetune.Dockerfile
-├── scripts/                                      # scripts/archived/ holds superseded versions
+├── scripts/
 │   ├── fetch_dropbox_files.py                    # Download resting-state EEG/fMRI recordings (credentials in scripts/.env)
 │   ├── run_tbss.sh                               # FSL TBSS on FA maps, then projection onto MD maps
 │   ├── prep_pyment.py, run_pyment.sh             # Prepare T1w inputs and run Pyment container (1: fine-tune, 2: predict)
-│   ├── make_df_preproc.py                        # Merge/clean source tables into df_preproc.csv & preproc_features.txt
-│   ├── make_df_scores.py                         # Build df_scores_ST.csv & composite cognitive score (cog_scores.json)
+│   ├── make_df_preproc.py                        # Merge/clean source tables into `df_preproc.csv` & `preproc_features.txt`
+│   ├── make_df_scores.py                         # Build `df_scores_ST.csv` & composite cognitive score (cog_scores.json)
 │   ├── make_df_dti_roi-means.py                  # Extract DTI ROI mean features (.csv and .npz)
 │   ├── make_df_rs-eeg_psd.py                     # Extract resting-state EEG PSD features (MNE)
 │   ├── make_df_rs-fmri_fc.py                     # Extract resting-state fMRI FC features (Nilearn)
-│   ├── models.py                                 # Custom estimators: TargetScaler, MSVR, MOGP (ICM)
-│   ├── training.py                               # Pipelines, CV, Optuna tuning, PLS Parallel Analysis, calibration
-│   ├── helpers.py                                # TBSS caching, CSV/NPZ I/O, latest-run lookup utilities
-│   ├── plotting.py                               # Matplotlib/Seaborn figure primitives & shared Style
-│   ├── utils.py                                  # Logging (custom_print, tee_output, mute_print), JSON helpers
+│   ├── models.py                                 # Estimator classes: TargetScaler, MSVR, MOGP (ICM)
+│   ├── training.py                               # Function `train_eval_model` and its parts: pipeline construction, hyperparameter search, PLS component selection, metrics, age-bias correction
+│   ├── helpers.py                                # Functions for data loading (TBSS cache, feature tables) & latest-run lookup
+│   ├── plotting.py                               # Plotting functions & the shared `Style`
+│   ├── utils.py                                  # Functions for logging (custom_print, tee_output, mute_print), JSON conversion
 │   ├── predict_ages.py                           # Main two-level training & prediction pipeline
-│   ├── summ_results.py                           # Fit metrics (pred_fits.csv) & Level-2 weights (coefficients.csv)
+│   ├── summ_results.py                           # Fit predicted on chronological age (pred_fits.csv) & export Level-2 weights (coefficients.csv)
 │   ├── eval_feats_imp.py                         # Multi-seed modality ablation & stepwise evaluation
-│   ├── calc_corr.py                              # PAD x cognitive score (partial) correlations & BH-FDR
+│   ├── calc_corr.py                              # Calculate PAD x cognitive score (partial) correlations with BH-FDR
 │   └── plot_results.py                           # Generate scatter, weight/importance, MAE, box & heatmap plots
 ├── environment.yml                               # Pinned Conda environment (conda-forge, Python 3.12)
 ├── environment.txt                               # Exact linux-64 Conda @EXPLICIT lockfile
