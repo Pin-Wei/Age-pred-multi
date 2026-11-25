@@ -11,15 +11,15 @@ import pandas as pd
 
 from helpers import get_tbss_processed, load_feat_table, print_missing
 from training import (
-    MODEL_TYPES, L1_RATIOS, ALPHAS, DEFAULT_PLS_MAX_K,
+    MODEL_TYPES, L1_RATIOS, ALPHAS, ALPHAS_LOWER, DEFAULT_PLS_MAX_K,
     calc_metrics, train_eval_model,
 )
 from utils import custom_print, tee_output, to_json_compatible
 
 
-SID, SET, AGE, COG = "SID", "Set", "Age", "Cog"  # column names
-TARGETS = [[AGE], [AGE, COG]]
-TARGET_KEYS = ["1y", "2y"]  # prefix of the first-level folder, one per entry of TARGETS
+SID, SET, AGE, COG, MIX = "SID", "Set", "Age", "Cog", "Mix"  # column names
+TARGETS = [[AGE], [AGE, COG], [MIX]]
+TARGET_KEYS = ["1y", "2y", "mix"]  # prefix of the first-level folder, one per entry of TARGETS
 LV1_OUTPUTS = ["targ-preds", "cross-decomp"]  # output type of the first-level models; target(s) predicted values or the components derived from cross-decomposition
 DECOMP_MDL = "pls"  # the model (algorithm) used for cross-decomposition
 
@@ -42,7 +42,8 @@ class Config:
 
     def setup_model_params(self, args: argparse.Namespace) -> None:
         self.targets = TARGETS[args.targets]
-        self.target_key = TARGET_KEYS[args.targets]
+        self.mix_in_years = args.mix_in_years and (MIX in self.targets)
+        self.target_key = TARGET_KEYS[args.targets] + ("a" if self.mix_in_years else "")  # "mixa": age scale
 
         self.lv1_output = args.lv1_output
         self.decomp = self.lv1_output == "cross-decomp"
@@ -64,7 +65,16 @@ class Config:
 
         self.model_lv2 = args.model_lv2
         self.l1_ratios = list(args.l1_ratios)
-        self.alphas = list(args.alphas)
+
+        # Use a lower-scale alpha grid by default for z-scored Mix unless --alphas was explicitly given
+        if args.alphas is None:
+            if (MIX in self.targets) and not self.mix_in_years:
+                self.alphas = list(ALPHAS_LOWER)
+            else:
+                self.alphas = list(ALPHAS)
+        else:
+            self.alphas = list(args.alphas)
+
         self.n_folds = args.n_folds
         self.seed = args.seed
         self.seed_inner = args.seed_inner
@@ -215,6 +225,7 @@ class Config:
         '''
         return {
             "targets"           : self.targets,
+            "mix_in_years"      : self.mix_in_years,
             "lv1_output"        : self.lv1_output,
             "pls_components"    : self.pls_components if self.decomp else None,
             "pls_max_components": self.pls_max_components if self.decomp else None,
@@ -265,6 +276,9 @@ def parse_args(
     grp_model = parser.add_argument_group("model")
     grp_model.add_argument("--targets", type=int, choices=range(len(TARGETS)), default=1, 
                            help="Target(s) for models to predict. " + ", ".join(f"{i}: {x}" for i, x in enumerate(TARGETS)))
+    grp_model.add_argument("--mix_in_years", action="store_true", 
+                           help=("Express the composite target in years rather than in units of its own std "
+                                 f"(applies to --targets {TARGETS.index([MIX])} only)."))
     grp_model.add_argument("--lv1_output", choices=LV1_OUTPUTS, default=LV1_OUTPUTS[0], 
                            help=("What first-level models pass to level 2: 'targ-preds' (predicted targets) or "
                                  f"'cross-decomp' ({DECOMP_MDL.upper()} latent components)."))
@@ -281,8 +295,8 @@ def parse_args(
                            help="Regression algorithm for the second-level model.")
     grp_model.add_argument("--l1_ratios", nargs="+", type=float, default=L1_RATIOS, metavar="R",
                            help="L1 penalty mixing parameter grid for ElasticNet models.")
-    grp_model.add_argument("--alphas", nargs="+", type=float, default=ALPHAS, metavar="A",
-                           help="Regularization strength grid for linear models.")
+    grp_model.add_argument("--alphas", nargs="+", type=float, default=None, metavar="A",
+                           help="Regularization strength grid for linear models; None picks ALPHAS (or ALPHAS_LOWER for z-scored Mix).")
     grp_model.add_argument("--n_folds", type=int, default=5,
                            help="Number of outer CV folds.")
     grp_model.add_argument("--max_iter", type=int, default=10000,
@@ -325,6 +339,56 @@ def split_indices(sets: pd.Series | np.ndarray) -> tuple[np.ndarray, np.ndarray]
     return np.flatnonzero(arr == "train"), np.flatnonzero(arr == "test")
 
 
+def make_mix(subj_df: pd.DataFrame, in_years: bool = False) -> pd.Series:
+    '''
+    Combine Age and Cog into one equal-weight composite target standardized on training rows.
+    Cog enters with the sign of its training correlation with Age so the two do not cancel out.
+    '''
+    tr_idx, _ = split_indices(subj_df[SET])
+    age_tr = subj_df[AGE].iloc[tr_idx]
+    cog_tr = subj_df[COG].iloc[tr_idx]
+
+    age_mean, age_std = float(age_tr.mean()), float(age_tr.std())
+    cog_mean, cog_std = float(cog_tr.mean()), float(cog_tr.std())
+    sign = -1.0 if float(age_tr.corr(cog_tr)) < 0 else 1.0
+
+    z_age = (subj_df[AGE] - age_mean) / age_std
+    z_cog = (subj_df[COG] - cog_mean) / cog_std
+    mix = (z_age + sign * z_cog) / 2.0
+    formula = f"[ z({AGE}) {'+' if sign > 0 else '-'} z({COG}) ] / 2"
+
+    if in_years:
+        mix = age_mean + age_std * mix
+        formula = f"{age_mean:.3f} + {age_std:.3f} * {formula}"
+
+    custom_print(f"\n'{MIX}' = {formula}, standardized on the {len(tr_idx)} training participants")
+
+    return mix
+
+
+def restore_from_mix(pred_df: pd.DataFrame) -> pd.DataFrame:
+    '''
+    Map every composite-target prediction back to Age and Cog via least-squares fits
+    estimated on the training participants, so downstream scripts find Age_* and Cog_*.
+    '''
+    is_train = pred_df[SET].to_numpy(dtype=str) == "train"
+    mix_cols = [ c for c in pred_df.columns if c.startswith((f"{MIX}_", f"C-{MIX}_")) ]
+    restored = {}
+
+    for target in (AGE, COG):
+        rows = is_train & pred_df[[MIX, target]].notna().all(axis=1).to_numpy()
+        slope, const = np.polyfit(pred_df.loc[rows, MIX], pred_df.loc[rows, target], 1)
+        for col in mix_cols:
+            name = col.replace(MIX, target, 1)  # replace only the leading target prefix
+            if name not in pred_df.columns:
+                restored[name] = const + slope * pred_df[col]
+        custom_print(
+            f"{target} = {const:.3f} + {slope:.3f} * {MIX}, fitted on {int(rows.sum())} training participants"
+        )
+
+    return pd.concat([pred_df, pd.DataFrame(restored, index=pred_df.index)], axis=1)
+
+
 def load_targets(config: Config) -> pd.DataFrame:
     subj_df = pd.read_csv(
         config.df_preproc_path,
@@ -334,7 +398,7 @@ def load_targets(config: Config) -> pd.DataFrame:
     subj_df.index.name = SID
     subj_df = subj_df.rename(columns={"BASIC_INFO_AGE": AGE})
 
-    need_cog = COG in config.targets
+    need_cog = (COG in config.targets) or (MIX in config.targets)
     if need_cog:
         if not config.cog_score_path.is_file():
             raise FileNotFoundError(f"'{config.cog_score_path.name}' does not exist; run make_df_scores.py first.")
@@ -352,6 +416,10 @@ def load_targets(config: Config) -> pd.DataFrame:
             f"\nDropped {n_dropped} participant(s) with missing target value(s) in {req_cols}.",
             level="WARNING",
         )
+
+    if MIX in config.targets:
+        subj_df[MIX] = make_mix(subj_df, config.mix_in_years)
+        return subj_df.loc[:, [SET, AGE, COG, MIX]]
 
     return subj_df.loc[:, [SET] + config.targets]
 
@@ -508,7 +576,16 @@ def add_pyment_results(
     missing = print_missing(pred_out[SID].to_list(), pyment_df[SID].to_list())
 
     lv1_cols_by_feat = dict(lv1_cols_by_feat)
-    lv1_cols_by_feat[f_name] = [f"{AGE}_{f_name}"]
+    if MIX in config.targets:
+        if config.mix_in_years:
+            pred_out[f"{MIX}_{f_name}"] = pred_out[f"{AGE}_{f_name}"]
+        else:
+            tr_idx, _ = split_indices(pred_out[SET])
+            age_tr = pred_out[AGE].iloc[tr_idx]
+            pred_out[f"{MIX}_{f_name}"] = (pred_out[f"{AGE}_{f_name}"] - age_tr.mean()) / age_tr.std()
+        lv1_cols_by_feat[f_name] = [f"{MIX}_{f_name}"]
+    else:
+        lv1_cols_by_feat[f_name] = [f"{AGE}_{f_name}"]
 
     valid = pred_out[[AGE, f"{AGE}_{f_name}"]].dropna()
     perf_all = (
@@ -608,6 +685,9 @@ def main(config: Config) -> None:
         save_pls_feats(pred_out, lv1_cols, config)
 
     pred_out, summ_out = run_lv2_model(pred_out, summ_by_feat, lv1_cols, config)
+
+    if MIX in config.targets:
+        pred_out = restore_from_mix(pred_out)
 
     config.pred_out_path.parent.mkdir(parents=True, exist_ok=True)
     pred_out.to_csv(config.pred_out_path, index=False)

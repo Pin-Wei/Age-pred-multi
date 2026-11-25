@@ -15,8 +15,11 @@ import pandas as pd
 from helpers import get_latest_results
 from predict_ages import Config as OrigConfig
 from predict_ages import parse_args as orig_parse_args
-from predict_ages import SID, SET, AGE, COG, TARGETS, LV1_OUTPUTS, load_targets
-from training import XGB_PARAM_SPACE, train_eval_model
+from predict_ages import (
+    SID, SET, AGE, COG, MIX, TARGETS, LV1_OUTPUTS, 
+    load_targets, restore_from_mix,
+)
+from training import ALPHAS, ALPHAS_LOWER, XGB_PARAM_SPACE, train_eval_model
 from utils import mute_print, to_json_compatible, tee_output
 
 
@@ -31,9 +34,11 @@ SPLIT_IDX_MAP = {  # {split: row index in the performance table}
     "Val" : "Val_pooled",
     "Test": "Test",
 }
-TARGET_PREFIX_MAP = {  # {prefix of the first-level folder: targets}
-    "1y": TARGETS[0],
-    "2y": TARGETS[1],
+TARGET_PREFIX_MAP = {
+    "1y"  : (TARGETS[0], False),
+    "2y"  : (TARGETS[1], False),
+    "mix" : (TARGETS[2], False),
+    "mixa": (TARGETS[2], True),
 }
 
 
@@ -89,16 +94,20 @@ class Config(OrigConfig):
         self.model_lv1 = lv1_parts[1]
         self.lv2_mdl_dir = self.proj_root / "models" / lv1_key / self.lv2_key
 
-        # Infer targets from lv1_key:
+        # Infer targets and mix_in_years from lv1_key:
         if target_prefix in TARGET_PREFIX_MAP:
-            inferred_targets = TARGET_PREFIX_MAP[target_prefix]
-            if self.targets != inferred_targets:
+            inferred_targets, inferred_mix_in_years = TARGET_PREFIX_MAP[target_prefix]
+            if (self.targets != inferred_targets) or (self.mix_in_years != inferred_mix_in_years):
                 print(
-                    f"\nInferred targets={inferred_targets} "
+                    f"\nInferred targets={inferred_targets} (mix_in_years={inferred_mix_in_years}) "
                     f"from folder '{lv1_key}' (overriding CLI --targets)."
                 )
                 self.targets = inferred_targets
+                self.mix_in_years = inferred_mix_in_years
                 self.target_key = target_prefix
+
+            if args.alphas is None:
+                self.alphas = list(ALPHAS_LOWER) if (MIX in self.targets and not self.mix_in_years) else list(ALPHAS)
 
         # Infer feat_src from folder tag (when --feat_src is omitted):
         if args.feat_src is None:
@@ -189,7 +198,7 @@ class Lv2Data:
         '''
         Participant identifiers and the targets, to be carried by every prediction table.
         '''
-        cols = [ c for c in [SID, SET, AGE, COG] if c in self.df.columns ]
+        cols = [ c for c in [SID, SET, AGE, COG, MIX] if c in self.df.columns ]
 
         return self.df[cols].copy()
 
@@ -265,6 +274,8 @@ def load_lv2_data(config: Config) -> Lv2Data:
         raise ValueError(f"No column of {config.feat_tbl_path.name} matches r'{config.block_pattern}'.")
 
     needed_meta = {SET, *config.targets}
+    if MIX in config.targets:
+        needed_meta |= {AGE, COG}
     if not needed_meta.issubset(df.columns):
         subj_df = load_targets(config).reset_index()
         extra_cols = [ c for c in subj_df.columns if c == SID or c not in df.columns ]
@@ -464,7 +475,7 @@ def make_pred_tables(
 ) -> dict[int, pd.DataFrame]:
     '''
     Build one prediction DataFrame per refitting seed holding raw and age-corrected
-    predictions across all evaluated subsets.
+    predictions across all evaluated subsets (restoring Age/Cog when target is Mix).
     '''
     def _name_subset(entry: Entry) -> str:
         if entry.mode == "full":
@@ -490,6 +501,8 @@ def make_pred_tables(
                     new_cols[f"C-{target}_{subset}"] = pred_ac_df[target].to_numpy()
 
         df = pd.concat([id_df, pd.DataFrame(new_cols, index=id_df.index)], axis=1)
+        if MIX in config.targets:
+            df = restore_from_mix(df)
         out_dict[seed] = df
 
     return out_dict
@@ -543,7 +556,7 @@ def main(config: Config) -> None:
     summ_out = {
         **{
             k: getattr(config, k) for k in [
-                "targets", "feat_src", "lv2_key", "feat_tbl_path",
+                "targets", "mix_in_years", "feat_src", "lv2_key", "feat_tbl_path",
                 "block_pattern", "modes", "score_by", "model_lv1", "model_lv2",
                 "n_folds", "seeds", "seed_inner", "l1_ratios", "alphas", "max_iter", "impute_data",
             ]
