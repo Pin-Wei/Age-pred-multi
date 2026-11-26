@@ -14,7 +14,7 @@ The pipeline integrates multiple brain and behavioral modalities through a two-l
 
 - **Level 2 (Multimodal Stacking Model)**: Trains a cross-validated second-level regressor (meta-model, `--model_lv2`, with median imputation for missing modalities) on the merged Level-1 predictions or PLS components to produce the final multimodal predictions, applies Cole's linear age-bias correction per fold, and (for `Mix` targets) maps composite predictions back to `Age` and `Cog` scales.
 
-- **Downstream Evaluation**: Summarizes regression fits and Level-2 weights/importances (`summ_results.py`), evaluates modality importance via multi-seed ablation and stepwise selection (`eval_feats_imp.py`), computes Benjamini–Hochberg FDR-corrected PAD–cognition correlations (`calc_corr.py`), and generates publication-ready figures (`plot_results.py`).
+- **Downstream Evaluation**: Summarizes regression fits and Level-2 weights/importances (`summ_results.py`), evaluates modality importance via multi-seed ablation and stepwise selection (`eval_feats_imp.py`), computes Benjamini-Hochberg FDR-corrected PAD-cognition correlations (`calc_corr.py`), and generates publication-ready figures (`plot_results.py`).
 
 ## 2. Repository Structure
 
@@ -84,9 +84,9 @@ conda activate age_pred
 | `MRI_ROI` | Regional structural T1w MRI measures (`STRUCTURE*`, excluding FA) | `make_df_preproc.py` |
 | `BEH_COGNITIVE` | Behavioral cognitive features (`LANGUAGE`, `MEMORY`, `MOTOR`) | `make_df_preproc.py` |
 | `rs-EEG_PSD` | Resting-state EEG power spectral density | `make_df_rs-eeg_psd.py` |
-| `Pyment` | Pre-trained 3-D CNN brain-age predictions from T1w MRI; enters Level 2 directly as one column | `run_pyment.sh` |
+| `Pyment` | Pre-trained 3-D CNN brain-age predictions from T1w MRI; enters Level-2 directly as one column | `run_pyment.sh` |
 
-Participants missing data for a block are omitted from that Level-1 model, and the resulting gaps are median-imputed at Level 2. `--feat_types` restricts Level 1 to specified blocks (`Pyment` is always added at Level 2).
+Participants missing data for a block are omitted from that Level-1 model, and the resulting gaps are median-imputed at Level-2. `--feat_types` restricts Level-1 to specified blocks (`Pyment` is always added at Level-2).
 
 ### 4.2. Targets (`--targets`)
 
@@ -130,15 +130,15 @@ python scripts/make_df_scores.py            # required whenever Cog or Mix is a 
 
 ### 5.2. Two-Level Training & Prediction (`predict_ages.py`)
 
-Splits the training set into `--n_folds` outer folds (`--seed`): training predictions are out-of-fold, test predictions come from the fold with the lowest validation MAE, and Level 2 is trained on these out-of-fold outputs with per-fold Cole age-bias correction (`C-*`). Existing `.joblib` models are reused unless `--overwrite_mdl` or `--add_new_mdls` is passed.
+Splits the training set into `--n_folds` outer folds (`--seed`): training predictions are out-of-fold, test predictions come from the fold with the lowest validation MAE, and Level-2 is trained on these out-of-fold outputs with per-fold Cole's age-bias correction (`C-*`). Existing `.joblib` models are reused unless `--overwrite_mdl` or `--add_new_mdls` is passed.
 
-Under `--lv1_output cross-decomp` (requires `--n_folds > 1`), `--pls_components` selects *K* once on the training split: an integer *K* *(default `20`)*, `cv` (lowest inner-CV MAE in `1..--pls_max_components`), or `auto` (cross-validated permutation Parallel Analysis selecting leading components whose out-of-fold $\Delta R^2 > 0$ exceeds the 95th percentile of `--pls_n_perm` target permutations). Each fold's PLS components are sign-aligned to fold 0, with cross-fold weight `|cos|` logged per component; `Pyment` still enters Level 2 as a single predicted-age column.
+Under `--lv1_output cross-decomp` (requires `--n_folds > 1`), `--pls_components` selects *K* once on the training split: an integer *K* *(default `20`)*, `cv` (lowest inner-CV MAE in `1..--pls_max_components`), or `auto` (cross-validated permutation Parallel Analysis selecting leading components whose out-of-fold $\Delta R^2 > 0$ exceeds the 95th percentile of `--pls_n_perm` target permutations). Each fold's PLS components are sign-aligned to fold 0, with cross-fold weight `|cos|` logged per component; `Pyment` still enters Level-2 as a single predicted-age column.
 
 ```
 # Default: Age + Cog, ElasticNet (Lv1) -> Ridge (Lv2)
 python scripts/predict_ages.py
 
-# Age only, XGBoost at Level 2 on CPU
+# Age only, XGBoost at Level-2 on CPU
 python scripts/predict_ages.py --targets 0 --model_lv2 xgboost --xgb_device cpu
 
 # Equal-weight composite target (Mix) on the age scale
@@ -168,7 +168,7 @@ python scripts/summ_results.py -p results/<lv1_key>/<lv2_key>/predictions.csv
 
 ### 5.4. Feature-Block Importance & Ablation (`eval_feats_imp.py`)
 
-Groups Level-2 input columns into modality blocks (plus `Pyment`) and refits Level 2 on subsets (`--modes`: `only_one`, `drop_one`, `forward`, `backward`, ranked by `--score_by`, default `Test_R2`) across `--n_seeds` (default `5`) reproducible seeds. Automatically infers `targets`, `mix_in_years`, `ALPHAS_LOWER` (for z-scored `Mix`), and `feat_src` (`targ-preds` vs `cross-decomp`) from the selected run folder name, and reuses saved Level-2 XGBoost hyperparameters. Note that custom `--alphas` grids are not read back from saved runs and should be passed explicitly if used.
+Groups Level-2 input columns into modality blocks (plus `Pyment`) and refits Level-2 on subsets (`--modes`: `only_one`, `drop_one`, `forward`, `backward`, ranked by `--score_by`, default `Test_R2`) across `--n_seeds` (default `5`) reproducible seeds. Automatically infers `targets`, `mix_in_years`, `ALPHAS_LOWER` (for z-scored `Mix`), and `feat_src` (`targ-preds` vs `cross-decomp`) from the selected run folder name, and reuses saved Level-2 XGBoost hyperparameters. Note that custom `--alphas` grids are not read back from saved runs and should be passed explicitly if used.
 
 ```
 # Evaluate the latest Level-2 run with only_one and drop_one ablation across 5 seeds
@@ -180,7 +180,7 @@ python scripts/eval_feats_imp.py --lv2_dir results/<lv1_key>/<lv2_key> --modes o
 
 ### 5.5. PAD × Cognitive Score Correlations (`calc_corr.py`)
 
-Correlates PAD from every model in `predictions_seed-*.csv` with every score in `df_scores_ST.csv` that was not used to build `Cog`. Supports `-pad` (`0` age-corrected `C-*`, `1` raw with age partialled out of PAD *\[default\]*, `2` raw), `-ps` (also partial age out of the scores), `-m` (`0` Pearson, `1` Spearman), and `-set` (`0` all, `1` test, `2` train). Averages correlations across seeds via Fisher's *z*, applies Benjamini–Hochberg FDR (`-fdr`, default `0.05`; `-fs 0` across all models or `-fs 1` per model), and tests per-model displacement from zero via Wilcoxon signed-rank tests:
+Correlates PAD from every model in `predictions_seed-*.csv` with every score in `df_scores_ST.csv` that was not used to build `Cog`. Supports `-pad` (`0`: age-corrected `C-*`, `1`: raw with age partialled out of PAD *\[default\]*, `2`: raw), `-ps` (also partial age out of the scores), `-m` (`0`: Pearson, `1`: Spearman), and `-set` (`0`: all, `1`: test, `2`: train). Averages correlations across seeds via Fisher's *z*, applies Benjamini-Hochberg FDR (`-fdr`, default `0.05`; `-fs 0` across all models or `-fs 1` per model), and tests per-model displacement from zero via Wilcoxon signed-rank tests:
 
 ```
 # Partial Pearson correlation controlling for chronological age (defaults)
@@ -206,10 +206,10 @@ python scripts/plot_results.py --to_draw 2 3 4 -d results/<lv1_key>/<lv2_key>/ev
 | ----- | ----- | ----- | 
 | `1` | `[scatter] Fits between real and predicted ages (<model>).png` | Predicted vs. chronological age per Level-1 model, `Pyment`, and Level 2 | 
 | `2` | `[bars] Coefficients of the fold-<k> 2nd-level model (<target>).png` | Linear Level 2 on `targ-preds`: signed sum of weights per block | 
-| `2` | `[bars] Weight norms (L2) of the fold-<k> 2nd-level model (<target>).png` | Linear Level 2 on `cross-decomp`: $L_2$ norm of weights per block (sign-invariant and fair against 1-column `Pyment`) | 
-| `2` | `[bars] Importances of the fold-<k> 2nd-level model (Importance).png` | XGBoost Level 2: gain importances summed per block (bars sum to 1) | 
+| `2` | `[bars] Weight norms (L2) of the fold-<k> 2nd-level model (<target>).png` | Linear Level-2 on `cross-decomp`: $L_2$ norm of weights per block (sign-invariant and fair against 1-column `Pyment`) | 
+| `2` | `[bars] Importances of the fold-<k> 2nd-level model (Importance).png` | XGBoost Level-2: gain importances summed per block (bars sum to 1) | 
 | `3` | `[bars] MAE of 2nd-level models (<set>).png` | Ablation model MAE (mean ± SD across seeds) with full-model baseline | 
-| `4` | `[boxes] Correlations between PAD[-<type>] and ST scores (<set>).png` | Distribution of each model's PAD–score correlations with FDR significance | 
+| `4` | `[boxes] Correlations between PAD[-<type>] and ST scores (<set>).png` | Distribution of each model's PAD-score correlations with FDR significance | 
 | `5` | `[heat] Correlations between PAD[-<type>] and ST scores (<set>).png` | Model × score correlation heatmap grouped by cognitive domain | 
 
 **Tip for concurrent runs**: When multiple runs are active at once, pass paths explicitly across the chain rather than relying on the latest-run lookup:
@@ -231,9 +231,9 @@ results/<lv1_key>/
 ├── <modality>.csv                                  # Level-1 per-fold, pooled, and test MAE / R²
 └── <lv2_key>/
     ├── predictions.csv                             # Per participant: targets, Lv1 outputs, *_Final, C-*_Final
-    ├── pls_feats.csv                               # PLS components handed to Level 2 (cross-decomp only)
+    ├── pls_feats.csv                               # PLS components handed to Level-2 (cross-decomp only)
     ├── performance.csv                             # Level-2 CV & test MAE / R²
-    ├── age-correction_params.csv                   # Per-fold Cole age-bias calibration (intercept & slope)
+    ├── age-correction_params.csv                   # Per-fold Cole's age-bias calibration (intercept & slope)
     ├── pred_fits.csv & coefficients.csv            # Generated by summ_results.py
     ├── summary.json & logs.txt                     # Full run metadata & execution log
     └── eval_<YYYY-MM-DD_HH-MM-SS>/
@@ -247,7 +247,7 @@ results/<lv1_key>/
 | ----- | ----- | ----- | 
 | `lv1_key` | `{target_key}_{mdl_tag}_cv{n_folds}_{seed}` | `2y_elasticnet_cv5_42` | 
 |  | Under `--lv1_output cross-decomp`: `mdl_tag` is `pls-comp{K}`, `pls-comp-auto`, or `pls-comp-cv` | `2y_pls-comp5_cv5_42` | 
-|  | Under `--model_lv1 pls` with non-`cv` `--pls_components`: `mdl_tag` is `pls-k{K}` or `pls-auto` | `2y_pls-k3_cv5_42` | 
+|  | Under `--model_lv1 pls` and `--pls_components` is not `cv`: `mdl_tag` is `pls-k{K}` or `pls-auto` | `2y_pls-k3_cv5_42` | 
 | `lv2_key` | `{model_lv2}_{seed}_{YYYY-MM-DD_HH-MM-SS}` | `ridge_42_2026-11-24_18-42-58` | 
 
 * `{target_key}` is `1y` (`Age`), `2y` (`Age + Cog`), `mix` (z-scored `Mix`), or `mixa` (`Mix` in years).
