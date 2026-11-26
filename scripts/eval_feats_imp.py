@@ -19,7 +19,7 @@ from predict_ages import (
     SID, SET, AGE, COG, MIX, TARGETS, LV1_OUTPUTS, 
     load_targets, restore_from_mix,
 )
-from training import ALPHAS, ALPHAS_LOWER, XGB_PARAM_SPACE, train_eval_model
+from training import XGB_PARAM_SPACE, train_eval_model
 from utils import mute_print, to_json_compatible, tee_output
 
 
@@ -105,9 +105,6 @@ class Config(OrigConfig):
                 self.targets = inferred_targets
                 self.mix_in_years = inferred_mix_in_years
                 self.target_key = target_prefix
-
-            if args.alphas is None:
-                self.alphas = list(ALPHAS_LOWER) if (MIX in self.targets and not self.mix_in_years) else list(ALPHAS)
 
         # Infer feat_src from folder tag (when --feat_src is omitted):
         if args.feat_src is None:

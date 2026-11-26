@@ -11,7 +11,7 @@ import pandas as pd
 
 from helpers import get_tbss_processed, load_feat_table, print_missing
 from training import (
-    MODEL_TYPES, L1_RATIOS, ALPHAS, ALPHAS_LOWER, DEFAULT_PLS_MAX_K,
+    MODEL_TYPES, L1_RATIOS, ALPHAS, DEFAULT_PLS_MAX_K,
     calc_metrics, train_eval_model,
 )
 from utils import custom_print, tee_output, to_json_compatible
@@ -65,15 +65,7 @@ class Config:
 
         self.model_lv2 = args.model_lv2
         self.l1_ratios = list(args.l1_ratios)
-
-        # Use a lower-scale alpha grid by default for z-scored Mix unless --alphas was explicitly given
-        if args.alphas is None:
-            if (MIX in self.targets) and not self.mix_in_years:
-                self.alphas = list(ALPHAS_LOWER)
-            else:
-                self.alphas = list(ALPHAS)
-        else:
-            self.alphas = list(args.alphas)
+        self.alphas = list(args.alphas)
 
         self.n_folds = args.n_folds
         self.seed = args.seed
@@ -295,8 +287,8 @@ def parse_args(
                            help="Regression algorithm for the second-level model.")
     grp_model.add_argument("--l1_ratios", nargs="+", type=float, default=L1_RATIOS, metavar="R",
                            help="L1 penalty mixing parameter grid for ElasticNet models.")
-    grp_model.add_argument("--alphas", nargs="+", type=float, default=None, metavar="A",
-                           help="Regularization strength grid for linear models; None picks ALPHAS (or ALPHAS_LOWER for z-scored Mix).")
+    grp_model.add_argument("--alphas", nargs="+", type=float, default=ALPHAS, metavar="A",
+                           help="Regularization strength grid for linear models.")
     grp_model.add_argument("--n_folds", type=int, default=5,
                            help="Number of outer CV folds.")
     grp_model.add_argument("--max_iter", type=int, default=10000,

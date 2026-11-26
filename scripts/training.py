@@ -13,7 +13,8 @@ from utils import custom_print
 MODEL_TYPES = ["elasticnet", "lasso", "ridge", "xgboost", "msvr", "mogp", "pls"]
 L1_RATIOS = [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
 ALPHAS = [1e-1, 1.0, 3.0, 1e1, 3e1, 1e2, 3e2, 1e3, 1e4, 1e5]
-ALPHAS_LOWER = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 1.0, 3.0, 1e1, 1e2, 1e3]  # for z-scored composite target
+# ALPHAS_LOWER = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 1.0, 3.0, 1e1, 1e2, 1e3]
+# ALPHAS = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0, 3.0, 1e1, 3e1, 1e2, 3e2, 1e3, 1e4, 1e5]
 XGB_PARAM_SPACE = {
     "max_depth"       : lambda t: t.suggest_int("max_depth", 1, 9),
     "learning_rate"   : lambda t: t.suggest_float("learning_rate", 1e-4, 1.0, log=True),
