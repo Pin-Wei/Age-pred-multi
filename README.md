@@ -8,7 +8,7 @@ The pipeline integrates multiple brain and behavioral modalities through a two-l
 
 - **Level 1 (Modality-Specific Models)**: Fits per-modality cross-validated models independently on each feature block (`DTI_FA`, `DTI_MD`, `rs-EEG_PSD`, `rs-MRI_FC`, `MRI_ROI`, `FUN_COGNITIVE`, `BEH_COGNITIVE`) and incorporates brain-age predictions from the pre-trained [Pyment](https://github.com/estenhl/pyment-public) 3-D CNN model. Level 1 supports two output routes (`--lv1_output`):
 
-   * **`targ-preds`** *(default)*: Passes out-of-fold / test target predictions from each modality to Level 2.
+   * **`targ-preds`** *(default)*: Passes out-of-fold / test target predictions from each modality to Level-2.
 
    * **`cross-decomp`**: Projects each modality onto supervised PLS latent components (with fixed *K*, inner-CV selection, or cross-validated permutation Parallel Analysis `--pls_components auto`, sign-aligned across folds to fold 0).
 
@@ -168,7 +168,7 @@ python scripts/summ_results.py -p results/<lv1_key>/<lv2_key>/predictions.csv
 
 ### 5.4. Feature-Block Importance & Ablation (`eval_feats_imp.py`)
 
-Groups Level-2 input columns into modality blocks (plus `Pyment`) and refits Level-2 on subsets (`--modes`: `only_one`, `drop_one`, `forward`, `backward`, ranked by `--score_by`, default `Test_R2`) across `--n_seeds` (default `5`) reproducible seeds. Automatically infers `targets`, `mix_in_years`, `ALPHAS_LOWER` (for z-scored `Mix`), and `feat_src` (`targ-preds` vs `cross-decomp`) from the selected run folder name, and reuses saved Level-2 XGBoost hyperparameters. Note that custom `--alphas` grids are not read back from saved runs and should be passed explicitly if used.
+Groups Level-2 input columns into modality blocks (plus `Pyment`) and refits Level-2 on subsets (`--modes`: `only_one`, `drop_one`, `forward`, `backward`, ranked by `--score_by`, default `Test_R2`) across `--n_seeds` (default `5`) reproducible seeds. Automatically infers `targets`, `mix_in_years`, and `feat_src` (`targ-preds` vs `cross-decomp`) from the selected run folder name, and reuses saved Level-2 XGBoost hyperparameters. Note that custom `--alphas` grids are not read back from saved runs and should be passed explicitly if used.
 
 ```
 # Evaluate the latest Level-2 run with only_one and drop_one ablation across 5 seeds
@@ -204,8 +204,8 @@ python scripts/plot_results.py --to_draw 2 3 4 -d results/<lv1_key>/<lv2_key>/ev
 
 | ID | Output File | Content | 
 | ----- | ----- | ----- | 
-| `1` | `[scatter] Fits between real and predicted ages (<model>).png` | Predicted vs. chronological age per Level-1 model, `Pyment`, and Level 2 | 
-| `2` | `[bars] Coefficients of the fold-<k> 2nd-level model (<target>).png` | Linear Level 2 on `targ-preds`: signed sum of weights per block | 
+| `1` | `[scatter] Fits between real and predicted ages (<model>).png` | Predicted vs. chronological age per Level-1 model, `Pyment`, and Level-2 | 
+| `2` | `[bars] Coefficients of the fold-<k> 2nd-level model (<target>).png` | Linear Level-2 on `targ-preds`: signed sum of weights per block | 
 | `2` | `[bars] Weight norms (L2) of the fold-<k> 2nd-level model (<target>).png` | Linear Level-2 on `cross-decomp`: $L_2$ norm of weights per block (sign-invariant and fair against 1-column `Pyment`) | 
 | `2` | `[bars] Importances of the fold-<k> 2nd-level model (Importance).png` | XGBoost Level-2: gain importances summed per block (bars sum to 1) | 
 | `3` | `[bars] MAE of 2nd-level models (<set>).png` | Ablation model MAE (mean ± SD across seeds) with full-model baseline | 
@@ -258,7 +258,7 @@ results/<lv1_key>/
 
 * **Composite-target PAD circularity**: Under `--targets 2`, PAD contains `SD(Age) × [ ±z(Cog) − z(Age) ] / 2` by construction (i.e. `−SD(Age) × [ z(Age) + z(Cog) ] / 2` when `Age` and `Cog` are negatively correlated), regardless of whether `--mix_in_years` is set. A correlation between this PAD and cognitive scores is therefore not by itself evidence that brain features carry cognitive signal.
 
-* **Regularization scale for `Mix`**: Without `--mix_in_years`, `Mix` has SD ≈ 1, so `--alphas` automatically defaults to `ALPHAS_LOWER` (`1e-3` to `1e3`) rather than `ALPHAS` (`0.1` to `1e5`).
+* **Regularization scale for `Mix`**: Without `--mix_in_years`, `Mix` has SD ≈ 1, which leaves RidgeCV unaffected but scales down the L1 penalty threshold of ElasticNetCV/LassoCV proportionally. Prefer --mix_in_years or pass a lower custom --alphas grid (e.g., starting at 1e-3) when fitting L1-penalized models on z-scored Mix.
 
 * **Comparing ablation runs**: `eval_feats_imp.py` redraws outer CV folds for each seed on fixed Level-1 outputs from the original run. Compare ablation models and `N_sig` within a single `eval_<timestamp>/` folder (or across folders produced with the same seeds), rather than directly against the original Level-2 run's absolute accuracy.
 
