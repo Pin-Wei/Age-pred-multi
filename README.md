@@ -258,7 +258,7 @@ results/<lv1_key>/
 
 * **Composite-target PAD circularity**: Under `--targets 2`, PAD contains `SD(Age) × [ ±z(Cog) − z(Age) ] / 2` by construction (i.e. `−SD(Age) × [ z(Age) + z(Cog) ] / 2` when `Age` and `Cog` are negatively correlated), regardless of whether `--mix_in_years` is set. A correlation between this PAD and cognitive scores is therefore not by itself evidence that brain features carry cognitive signal.
 
-* **Regularization scale for `Mix`**: Without `--mix_in_years`, `Mix` has SD ≈ 1, which leaves RidgeCV unaffected but scales down the L1 penalty threshold of ElasticNetCV/LassoCV proportionally. Prefer --mix_in_years or pass a lower custom --alphas grid (e.g., starting at 1e-3) when fitting L1-penalized models on z-scored Mix.
+* **Regularization scale for `Mix`**: Without `--mix_in_years`, `Mix` has SD ≈ 1, which leaves RidgeCV unaffected but scales down the L1 penalty threshold of ElasticNetCV/LassoCV proportionally. Prefer `--mix_in_years` or pass a lower custom `--alphas` grid (e.g., starting at 1e-3) when fitting L1-penalized models on z-scored Mix.
 
 * **Comparing ablation runs**: `eval_feats_imp.py` redraws outer CV folds for each seed on fixed Level-1 outputs from the original run. Compare ablation models and `N_sig` within a single `eval_<timestamp>/` folder (or across folders produced with the same seeds), rather than directly against the original Level-2 run's absolute accuracy.
 
